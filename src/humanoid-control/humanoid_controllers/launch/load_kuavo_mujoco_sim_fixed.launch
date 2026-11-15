@@ -74,7 +74,7 @@
   <node pkg="nodelet" type="nodelet" name="ekf_se" 
         args="load RobotLocalization/EkfNodelet nodelet_manager" 
         respawn="true" respawn_delay="5" output="screen" required="false" 
-        launch-prefix="taskset -c 8-15">
+>
     <rosparam command="load" file="$(find humanoid_estimation)/params/ekf_template.yaml" />
   </node>
 

@@ -79,8 +79,7 @@ fi
 # 创建新容器
 if [[ -z "$EXISTING_CONTAINER" ]]; then
     echo "Creating a new container '${CONTAINER_NAME}' based on image '${IMAGE_NAME}' ..."
-	docker run -it --net host --gpus all \
-		--runtime nvidia \
+	docker run -it --net host \
         --name $CONTAINER_NAME \
 		--privileged \
 		-v /dev:/dev \
@@ -88,8 +87,6 @@ if [[ -z "$EXISTING_CONTAINER" ]]; then
 		-v "$CCACHE_DIR:/root/.ccache" \
 		-v "$PARENT_DIR:/root/kuavo_ws" \
 		-v "${HOME}/.config/lejuconfig:/root/.config/lejuconfig" \
-        -e NVIDIA_VISIBLE_DEVICES=all \
-        -e NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics,display \
         -e CARB_GRAPHICS_API=vulkan \
         -e GDK_SYNCHRONIZE=1 \
 		-e HOME=/root \
