@@ -40,6 +40,12 @@ WEIGH_TRANSIT_IK_Z = 0.326217
 WEIGH_RELEASE_IK = [0.396, -0.574, 0.146217]
 WEIGH_REGRASP_IK = [0.396, -0.574, -0.04]
 IK_MODE_THREE_POINT_MIXED = 0x06
+ARM_MODE_EXTERNAL_CONTROL = 2
+ARM_MODE_SERVICE = "/arm_traj_change_mode"
+# 官方参考实现的左手等待位（锁左臂用；若锁"当前FK"会导致右臂IK无解）
+LEFT_PRESET_2_IK = [0.313, 0.239, 0.282]
+LEFT_PRESET_2_FIRST_YPR = [-146.440, 4.966, 0.0]
+LEFT_PRESET_2_SECOND_YPR = [0.0, 0.0, 96.580]
 RIGHT_PICK_FIRST_YPR = [0, -90, 0.0]
 RIGHT_PICK_SECOND_YPR = [90, 0.0, 0.0]
 WEIGH_RELEASE_FIRST_YPR = [0, -100, 0.0]
@@ -58,6 +64,11 @@ CAM_POS = [0.1187, 0.0, 0.6388]
 CAM_QUAT = [0.6159, -0.6159, 0.3474, -0.3474]  # xyzw
 CAM_X_CORRECTION = -0.057  # 标定得到的 x 系统偏移
 PARCEL_PLANE_Z_BASE = -0.044
+CAMR_FX = 623.5
+CAMR_FY = 623.5
+CAMR_CX = 640.0
+CAMR_CY = 360.0
+CAMR_FRAME = "Right wrist Camera View"
 
 
 def _cross3(a, b):
@@ -226,6 +237,18 @@ class Scene1Runner:
         for _ in range(5):
             self.gripper_pub.publish(m); rospy.sleep(0.05)
 
+    def set_arm_mode(self, mode=ARM_MODE_EXTERNAL_CONTROL, timeout=10.0):
+        import rospy
+        from kuavo_msgs.srv import changeArmCtrlMode, changeArmCtrlModeRequest
+        rospy.wait_for_service(ARM_MODE_SERVICE, timeout=timeout)
+        proxy = rospy.ServiceProxy(ARM_MODE_SERVICE, changeArmCtrlMode)
+        req = changeArmCtrlModeRequest()
+        req.control_mode = mode
+        resp = proxy(req)
+        if not resp.result:
+            raise RuntimeError("arm mode %s rejected: %s" % (mode, resp.message))
+        self.log("scene1: arm mode -> %s OK (%s)", mode, resp.message)
+
     def read_gripper_state(self):
         import rospy
         from sensor_msgs.msg import JointState
@@ -295,13 +318,12 @@ class Scene1Runner:
             raise RuntimeError("fk failed")
         return resp.hand_poses
 
-    # 右手到目标位姿（左手锁当前 FK）
+    # 右手到目标位姿（左手锁官方等待位，避免联合IK无解）
     def right_arm_to(self, arm_hold, ik_pos, quat):
         cur = self.read_current_arm_rad()
-        fk = self.call_fk(cur, 10.0)
-        left_pos = list(fk.left_pose.pos_xyz)
-        left_quat = list(fk.left_pose.quat_xyzw)
-        q = self.call_ik(left_pos, left_quat, ik_pos, quat, cur)
+        if not hasattr(self, "_left_quat_fixed"):
+            self._left_quat_fixed = quat_from_ypr(LEFT_PRESET_2_FIRST_YPR, LEFT_PRESET_2_SECOND_YPR)
+        q = self.call_ik(LEFT_PRESET_2_IK, self._left_quat_fixed, ik_pos, quat, cur)
         # 左手保持当前
         cur_deg = [math.degrees(v) for v in cur]
         q_deg = [math.degrees(v) for v in q]
@@ -346,6 +368,46 @@ class Scene1Runner:
             rospy.sleep(0.1)
         return False
 
+    def wrist_parcel_base(self):
+        import rospy
+        import cv2
+        import numpy as np
+        import tf
+        from sensor_msgs.msg import CompressedImage
+        m = rospy.wait_for_message('/cam_r/color/image_raw/compressed', CompressedImage, timeout=8)
+        img = cv2.imdecode(np.frombuffer(m.data, np.uint8), cv2.IMREAD_COLOR)
+        h, _ = img.shape[:2]
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        mask = (hsv[:, :, 2] > 165).astype(np.uint8) * 255
+        k = np.ones((5, 5), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k)
+        n, _l, stats, cents = cv2.connectedComponentsWithStats(mask, 8)
+        best = None
+        best_area = 0
+        for i in range(1, n):
+            area = stats[i][4]
+            if area > best_area:
+                best_area = area
+                best = cents[i]
+        if best is None:
+            return None
+        u, v = best
+        lst = tf.TransformListener()
+        try:
+            lst.waitForTransform('base_link', CAMR_FRAME, rospy.Time(0), rospy.Duration(3))
+            pos, quat = lst.lookupTransform('base_link', CAMR_FRAME, rospy.Time(0))
+        except Exception as e:
+            self.log("wrist TF fail: %s", e)
+            return None
+        dcam = [(u - CAMR_CX) / CAMR_FX, (v - CAMR_CY) / CAMR_FY, 1.0]
+        dbase = _rot_vec(dcam, quat)
+        t = (PARCEL_PLANE_Z_BASE - pos[2]) / dbase[2]
+        bx = pos[0] + t * dbase[0]
+        by = pos[1] + t * dbase[1]
+        self.log("wrist parcel base=(%.3f, %.3f) uv=(%.0f, %.0f) area=%d", bx, by, u, v, best_area)
+        return [bx, by]
+
     def run_parcel(self, arm_hold, name, ik_xy):
         offset = self._grasp_offset(ik_xy[1])
         px = ik_xy[0] + offset[0]
@@ -354,6 +416,25 @@ class Scene1Runner:
         # 预抓取（高位对齐）
         pre = [px, py, RIGHT_PICK_TRANSIT_IK_Z]
         self.right_arm_to(arm_hold, pre, self.right_pick_quat)
+        # 诊断：第一个包裹拍头部图看手臂是否到位
+        if not getattr(self, "_head_snap_done", False):
+            self._head_snap_done = True
+            self.save_head_snapshot("/tmp/pregrasp_head.png")
+        # 视觉伺服：腕相机检测快递，校正抓取 x/y
+        wb = self.wrist_parcel_base()
+        if wb is not None:
+            dx = wb[0] - px
+            dy = wb[1] - py
+            if abs(dx) > 0.03 or abs(dy) > 0.03:
+                self.log("scene1 %s wrist detect outlier (dx=%.3f dy=%.3f), ignored", name, dx, dy)
+                dx = 0.0
+                dy = 0.0
+            if abs(dx) > 0.005 or abs(dy) > 0.005:
+                px += dx
+                py += dy
+                pre = [px, py, RIGHT_PICK_TRANSIT_IK_Z]
+                self.right_arm_to(arm_hold, pre, self.right_pick_quat)
+                self.log("scene1 %s visual-servo corrected to (%.3f, %.3f)", name, px, py)
         # 下降抓取
         grasp = [px, py, pz]
         self.right_arm_to(arm_hold, grasp, self.right_pick_quat)
@@ -405,8 +486,26 @@ def run_scene(scene, seed, time_limit=None, timer_gui=True):
     runner = Scene1Runner()
     rospy.sleep(2.0)
 
+    # 等机器人站起 + 传感器就绪（过早调用 arm mode 服务会把节点打崩）
+    try:
+        rospy.wait_for_message("/bot_stand_up_complete", rospy.AnyMsg, timeout=150)
+        rospy.loginfo("scene1: stand-up complete")
+    except Exception as e:
+        rospy.logwarn("scene1: stand-up wait: %s", e)
+
     arm_pub = runner.arm_pub
-    cur = runner.read_current_arm_rad(10.0)
+    cur = runner.read_current_arm_rad(90.0)
+    rospy.loginfo("scene1: sensors ready")
+
+    # 关键：切换到外部控制模式(2)，否则手臂不跟随 /kuavo_arm_traj
+    for _attempt in range(5):
+        try:
+            runner.set_arm_mode(ARM_MODE_EXTERNAL_CONTROL, 20.0)
+            rospy.loginfo("scene1: arm mode set OK")
+            break
+        except Exception as e:
+            rospy.logwarn("scene1: set arm mode attempt %d failed: %s", _attempt + 1, e)
+            rospy.sleep(3.0)
     arm_hold = ArmHold(arm_pub, [math.degrees(v) for v in cur])
     arm_hold.start()
     # 预设

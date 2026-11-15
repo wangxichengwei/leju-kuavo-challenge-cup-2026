@@ -47,7 +47,48 @@ source /root/kuavo_ws/devel/setup.bash
 pkill -9 -f ros; pkill -9 -f nodelet; pkill -9 -f mujoco; pkill -9 -f humanoid; pkill -9 -f arms_ik; pkill -9 -f motion_capture
 ```
 
+启动任务必须遵守的时序（踩过坑，不可颠倒）：
+
+1. 先等机器人站起：`/bot_stand_up_complete`；
+2. 再读一次 `/sensors_data_raw` 确认传感器已上线；
+3. **然后才调用 `/arm_traj_change_mode` 切到外部控制模式（control_mode=2）**；
+4. 最后才开始下发 `/kuavo_arm_traj`。
+
+> 若在 `launcher.start()` 返回后立刻调用 `/arm_traj_change_mode`，该服务会报
+> "transport error" 并随后消失（节点被打断），后续 IK 全部失败。必须等站起+传感器就绪。
+
 运行任务：`rosrun challenge_cup_task_template challenge_task.py --scene scene1 --seed 0 --no-timer-gui`
+
+## 3.6 机械臂 / IK 使用规约（重要）
+
+- **手臂必须处于外部控制模式(2)**：默认是自动摆动模式(1)，此时 `/kuavo_arm_traj` 完全不生效。
+  切换方式与时机见 §3.5（顺序错了会把服务打崩）。
+- **锁左臂要用官方等待位**：两臂联合 IK 中，左手必须锁在
+  `LEFT_PRESET_2_IK=[0.313, 0.239, 0.282]` + 对应四元数；锁"当前 FK 位姿"会导致
+  `Right hand out of workspace!`（右臂 IK 无解）。
+- **坐标系别搞混**：`base_link` 原点在世界 `[-0.566, 0.014, 0.924]` 附近，不是世界原点；
+  world→IK(base) 固定偏移 `WORLD_TO_IK_OFFSET=[0.565966, -0.013886, -0.923783]`。
+- **IK 参数**：`constraint_mode=0x06`（三点混合）、`major_iterations_limit=500`、
+  `use_custom_ik_param=True`、`joint_angles_as_q0=True`。
+- **/kuavo_arm_traj 单位是度**，14 个关节（arm_joint_1..14），需按 ~50Hz 持续发布保持，
+  单次发布不会保持到位。
+- **夹爪**：`/gripper/command`（JointState，left/right_gripper_joint）：**0=张开，255=闭合**；
+  官方服务 `/control_robot_leju_claw` 用 0~100%。
+
+## 3.7 感知与标定规约（重要）
+
+- **禁止上帝接口**：`/mujoco/qpos`、`/ground_truth/state`、`set_object_position`、
+  `set_object_position_lock` 均为禁用接口，反作弊监控会杀节点。官方 `test/collect_*`
+  参考代码里用 `challenge_secret.get_object_layout` 的写法**只能借鉴其机械臂/夹爪/IK 机制，
+  不能抄它的感知**。
+- **头部相机**（`/cam_h`）：fx=fy=392.9, cx=640, cy=360, 1280x720，帧 `Head Camera View`；
+  base_link→相机 pos=[0.1187,0,0.6388], quat=[0.6159,-0.6159,0.3474,-0.3474]（xyzw）。
+- **像素→base**：射线与平面 z=-0.044 求交后，x 还需 **-0.057 标定修正**（y 误差 <0.016m 可接受）。
+- **检测阈值会把机器人自己当目标**：亮度阈值 V>165 会把白色机械臂/夹爪误检成快递，
+  统计 blob 数会虚高（实测多出 2 个）。需加几何/颜色过滤，或直接看图核对（判定规则见 §6）。
+- **腕部相机**（`/cam_r`）：fx=fy=623.5, cx=640, cy=360，帧 `Right wrist Camera View`；
+  在预抓取位（z=0.12）实测**看不到桌面**（朝外看墙），不能直接用于视觉伺服，
+  需先调整姿态让相机朝向桌面。
 
 ## 4. 开发规范
 
@@ -70,6 +111,9 @@ pkill -9 -f ros; pkill -9 -f nodelet; pkill -9 -f mujoco; pkill -9 -f humanoid; 
 
 - 依据修改范围执行：编译检查（catkin build）、单元测试、集成 / 功能测试、必要的人工验证。
 - 测试结果必须真实记录；环境不允许时说明哪些未执行、原因与风险；禁止把未验证功能描述为通过。
+- **抓取/搬运类任务不得用夹爪关节角判定成功**：闭爪值 <0.8 只说明手指碰到东西（可能是桌面、
+  空气或自身），不代表夹住了目标。必须以"目标物体是否离开原位 / 是否落入目标区域"为准，
+  且用相机图像人工/程序化核对（参考 `verify_weigh.py` 的做法）。
 
 ## 7. 会话交接规范
 
