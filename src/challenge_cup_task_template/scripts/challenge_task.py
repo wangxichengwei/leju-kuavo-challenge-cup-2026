@@ -34,11 +34,11 @@ RIGHT_PICK_IK_Z = -0.03
 RIGHT_PICK_TRANSIT_IK_Z = 0.12
 RIGHT_PICK_NEAR_FAR_Y_THRESHOLD = -0.20
 RIGHT_PICK_OFFSET_FAR_ROW = [-0.03, 0.0, 0.0]
-RIGHT_PICK_OFFSET_NEAR_ROW = [-0.03, 0.02, 0.0]
+RIGHT_PICK_OFFSET_NEAR_ROW = [-0.03, 0.02, -0.02]
 LIFT_Z_OFFSET = 0.30
 WEIGH_TRANSIT_IK_Z = 0.326217
-WEIGH_RELEASE_IK = [0.396, -0.50, 0.146217]
-WEIGH_REGRASP_IK = [0.396, -0.50, -0.04]
+WEIGH_RELEASE_IK = [0.396, -0.574, 0.146217]
+WEIGH_REGRASP_IK = [0.396, -0.574, -0.04]
 IK_MODE_POS_HARD_ORI_HARD = 0x03
 IK_MODE_THREE_POINT_MIXED = 0x06
 ARM_MODE_EXTERNAL_CONTROL = 2
@@ -47,7 +47,7 @@ ARM_MODE_SERVICE = "/arm_traj_change_mode"
 LEFT_PRESET_2_IK = [0.313, 0.239, 0.282]
 LEFT_PRESET_2_FIRST_YPR = [-146.440, 4.966, 0.0]
 LEFT_PRESET_2_SECOND_YPR = [0.0, 0.0, 96.580]
-RIGHT_PICK_FIRST_YPR = [0, 0, 0.0]
+RIGHT_PICK_FIRST_YPR = [0, -90, 0.0]
 RIGHT_PICK_SECOND_YPR = [90, 0.0, 0.0]
 WEIGH_RELEASE_FIRST_YPR = [0, -100, 0.0]
 WEIGH_RELEASE_SECOND_YPR = [90, 0.0, 0.0]
@@ -287,7 +287,7 @@ class Scene1Runner:
         req = twoArmHandPoseCmd()
         p = ikSolveParam()
         p.major_optimality_tol = 1e-3; p.major_feasibility_tol = 1e-3; p.minor_feasibility_tol = 1e-3
-        p.major_iterations_limit = 500; p.oritation_constraint_tol = 1e-3; p.pos_constraint_tol = 1e-3
+        p.major_iterations_limit = 100; p.oritation_constraint_tol = 1e-3; p.pos_constraint_tol = 1e-3
         p.pos_cost_weight = 1.0; p.constraint_mode = constraint_mode
         req.ik_param = p
         req.use_custom_ik_param = True
@@ -324,7 +324,7 @@ class Scene1Runner:
 
     # 右手到目标位姿（左手锁官方等待位，避免联合IK无解）
     def right_arm_to(self, arm_hold, ik_pos, quat,
-                     constraint_mode=IK_MODE_THREE_POINT_MIXED, lock_left_preset=True):
+                     constraint_mode=IK_MODE_THREE_POINT_MIXED, lock_left_preset=False):
         cur = self.read_current_arm_rad()
         if lock_left_preset:
             if not hasattr(self, "_left_quat_fixed"):
@@ -358,7 +358,7 @@ class Scene1Runner:
             self.right_arm_to(
                 arm_hold, ik_pos, quat,
                 constraint_mode=IK_MODE_THREE_POINT_MIXED,
-                lock_left_preset=True)
+                lock_left_preset=False)
 
     def world_to_ik(self, world):
         return [world[i] + WORLD_TO_IK_OFFSET[i] for i in range(3)]
