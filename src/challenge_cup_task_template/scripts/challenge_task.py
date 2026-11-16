@@ -34,11 +34,12 @@ RIGHT_PICK_IK_Z = -0.03
 RIGHT_PICK_TRANSIT_IK_Z = 0.12
 RIGHT_PICK_NEAR_FAR_Y_THRESHOLD = -0.20
 RIGHT_PICK_OFFSET_FAR_ROW = [-0.03, 0.0, 0.0]
-RIGHT_PICK_OFFSET_NEAR_ROW = [-0.03, 0.02, -0.02]
+RIGHT_PICK_OFFSET_NEAR_ROW = [-0.03, 0.02, 0.0]
 LIFT_Z_OFFSET = 0.30
 WEIGH_TRANSIT_IK_Z = 0.326217
-WEIGH_RELEASE_IK = [0.396, -0.574, 0.146217]
-WEIGH_REGRASP_IK = [0.396, -0.574, -0.04]
+WEIGH_RELEASE_IK = [0.396, -0.50, 0.146217]
+WEIGH_REGRASP_IK = [0.396, -0.50, -0.04]
+IK_MODE_POS_HARD_ORI_HARD = 0x03
 IK_MODE_THREE_POINT_MIXED = 0x06
 ARM_MODE_EXTERNAL_CONTROL = 2
 ARM_MODE_SERVICE = "/arm_traj_change_mode"
@@ -46,7 +47,7 @@ ARM_MODE_SERVICE = "/arm_traj_change_mode"
 LEFT_PRESET_2_IK = [0.313, 0.239, 0.282]
 LEFT_PRESET_2_FIRST_YPR = [-146.440, 4.966, 0.0]
 LEFT_PRESET_2_SECOND_YPR = [0.0, 0.0, 96.580]
-RIGHT_PICK_FIRST_YPR = [0, -90, 0.0]
+RIGHT_PICK_FIRST_YPR = [0, 0, 0.0]
 RIGHT_PICK_SECOND_YPR = [90, 0.0, 0.0]
 WEIGH_RELEASE_FIRST_YPR = [0, -100, 0.0]
 WEIGH_RELEASE_SECOND_YPR = [90, 0.0, 0.0]
@@ -276,7 +277,8 @@ class Scene1Runner:
         except Exception as e:
             self.log("scene1 snapshot failed %s" % e)
 
-    def call_ik(self, left_pos, left_quat, right_pos, right_quat, current_rad, timeout=5.0):
+    def call_ik(self, left_pos, left_quat, right_pos, right_quat, current_rad, timeout=5.0,
+                constraint_mode=IK_MODE_THREE_POINT_MIXED):
         import rospy
         from kuavo_msgs.msg import twoArmHandPoseCmd, ikSolveParam
         from kuavo_msgs.srv import twoArmHandPoseCmdSrv
@@ -284,7 +286,7 @@ class Scene1Runner:
         p = ikSolveParam()
         p.major_optimality_tol = 1e-3; p.major_feasibility_tol = 1e-3; p.minor_feasibility_tol = 1e-3
         p.major_iterations_limit = 500; p.oritation_constraint_tol = 1e-3; p.pos_constraint_tol = 1e-3
-        p.pos_cost_weight = 0.0; p.constraint_mode = IK_MODE_THREE_POINT_MIXED
+        p.pos_cost_weight = 0.0; p.constraint_mode = constraint_mode
         req.ik_param = p
         req.use_custom_ik_param = True
         req.joint_angles_as_q0 = True
@@ -319,17 +321,42 @@ class Scene1Runner:
         return resp.hand_poses
 
     # 右手到目标位姿（左手锁官方等待位，避免联合IK无解）
-    def right_arm_to(self, arm_hold, ik_pos, quat):
+    def right_arm_to(self, arm_hold, ik_pos, quat,
+                     constraint_mode=IK_MODE_THREE_POINT_MIXED, lock_left_preset=True):
         cur = self.read_current_arm_rad()
-        if not hasattr(self, "_left_quat_fixed"):
-            self._left_quat_fixed = quat_from_ypr(LEFT_PRESET_2_FIRST_YPR, LEFT_PRESET_2_SECOND_YPR)
-        q = self.call_ik(LEFT_PRESET_2_IK, self._left_quat_fixed, ik_pos, quat, cur)
+        if lock_left_preset:
+            if not hasattr(self, "_left_quat_fixed"):
+                self._left_quat_fixed = quat_from_ypr(
+                    LEFT_PRESET_2_FIRST_YPR, LEFT_PRESET_2_SECOND_YPR)
+            left_pos = LEFT_PRESET_2_IK
+            left_quat = self._left_quat_fixed
+        else:
+            fk = self.call_fk(cur)
+            left_pos = list(fk.left_pose.pos_xyz)
+            left_quat = list(fk.left_pose.quat_xyzw)
+        q = self.call_ik(
+            left_pos, left_quat, ik_pos, quat, cur,
+            constraint_mode=constraint_mode)
         # 左手保持当前
         cur_deg = [math.degrees(v) for v in cur]
         q_deg = [math.degrees(v) for v in q]
         target = cur_deg[:7] + q_deg[7:14]
         self.move_arm_deg(arm_hold, target)
         self.wait_converge(3.0)
+
+    def right_grasp_to(self, arm_hold, ik_pos, quat):
+        """最终下探优先使用位姿硬约束；无解时保留原混合约束回退。"""
+        try:
+            self.right_arm_to(
+                arm_hold, ik_pos, quat,
+                constraint_mode=IK_MODE_POS_HARD_ORI_HARD,
+                lock_left_preset=False)
+        except RuntimeError as exc:
+            self.log("scene1 hard grasp IK failed, fallback to mixed IK: %s" % exc)
+            self.right_arm_to(
+                arm_hold, ik_pos, quat,
+                constraint_mode=IK_MODE_THREE_POINT_MIXED,
+                lock_left_preset=True)
 
     def world_to_ik(self, world):
         return [world[i] + WORLD_TO_IK_OFFSET[i] for i in range(3)]
@@ -437,7 +464,7 @@ class Scene1Runner:
                 self.log("scene1 %s visual-servo corrected to (%.3f, %.3f)", name, px, py)
         # 下降抓取
         grasp = [px, py, pz]
-        self.right_arm_to(arm_hold, grasp, self.right_pick_quat)
+        self.right_grasp_to(arm_hold, grasp, self.right_pick_quat)
         self.set_gripper(GRIP_OPEN, GRIP_CLOSE)  # 右手闭
         import rospy; rospy.sleep(1.0)
         g = self.read_gripper_state()
