@@ -248,3 +248,13 @@ vision MCP 对 4 个包裹「闭爪瞬间」手指 vs 包裹的判定（均未�
 关键结论：偏差方向不一致（右上/下/右下），说明是 detect_parcels 的「亮斑质心」不等于包裹几何中心，误差随包裹朝向/光照/遮挡漂移。固定 grasp_offset 无法补偿这类逐包裹不同的偏差。
 
 正确修法：改检测——用包裹完整轮廓的 bounding box 中心（或结合深度图），而非亮斑质心。
+### 14.5 真元凶：pos_cost_weight=0.0（2026-11-17 FK 实测定位）
+
+- FK 实测（闭爪后读末端实际位置 vs 指令）：
+  - pos_cost_weight=0.0 时：x 误差 +6.8~+11.2cm、z 误差 +5.0~+5.8cm（手指悬空/偏移，必抓空）
+  - pos_cost_weight=1.0 后：x 误差降到 -5.8~+3.3cm，明显改善但仍不够（需 <1cm 才能跨住 2.25cm 窄边）
+- 官方 collect_scene1_handoff_dataset.py 关键参数：SCENE1_IK_POS_COST_WEIGHT=1.0、RIGHT_GRASP_FINAL_CONSTRAINT_MODE=0x03、SCENE1_IK_MAJOR_ITERATIONS_LIMIT=100
+- 官方最终抓取用 _call_one_hand_ik（单手 IK）：右手设目标 + 左手锁当前 FK + 只取右手关节，constraint_mode=0x03（位置硬）。
+- Codex 的 right_grasp_to 是双臂联合 IK（左手锁 LEFT_PRESET_2_IK 常量），且 0x03 在 detect 目标上频繁无解回退 0x06。
+
+下一步（明确）：对齐官方单手 IK——右手目标 + 左手锁当前 FK + 0x03 硬约束 + 只取右手关节；并确保 detect 目标落在 0x03 硬约束可达范围（必要时 clamp）。

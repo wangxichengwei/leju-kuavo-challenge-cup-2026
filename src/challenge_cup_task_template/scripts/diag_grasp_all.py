@@ -87,6 +87,15 @@ def main():
             rospy.sleep(2.5)
             g = runner.read_gripper_state()
             rospy.loginfo("DIAG parcel %d after-close right_gripper=%s", idx, g)
+            # FK 实测末端位置，对比指令：分离"检测误差"vs"IK/执行误差"
+            try:
+                cur_rad = runner.read_current_arm_rad(10)
+                fk = runner.call_fk(cur_rad, 5.0)
+                rp = list(fk.right_pose.pos_xyz)
+                rospy.loginfo("DIAG parcel %d FK_right=(%.3f,%.3f,%.3f) err_vs_grasp=(%.3f,%.3f,%.3f)",
+                              idx, rp[0], rp[1], rp[2], rp[0]-gx, rp[1]-gy, rp[2]-gz)
+            except Exception as e:
+                rospy.logwarn("DIAG parcel %d FK read failed: %s", idx, e)
             ok = snap_with_retry(runner, "/tmp/diag_closed_parcel_%d.png" % idx)
             rospy.loginfo("DIAG parcel %d snapshot ok=%s", idx, ok)
         except Exception as e:

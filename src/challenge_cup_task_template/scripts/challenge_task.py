@@ -111,10 +111,12 @@ def detect_parcels(logfn):
     n, _l, stats, cents = cv2.connectedComponentsWithStats(mask, 8)
     found = []
     for i in range(1, n):
-        _x, _y, _bw, _bh, area = stats[i]
+        x, y, bw, bh, area = stats[i]
         if area < 800 or area > 6000:
             continue
-        u, v = cents[i]
+        # 用 bounding box 中心，而非亮斑质心（质心会被反光/标签的不均匀亮度拉偏）
+        u = x + bw / 2.0
+        v = y + bh / 2.0
         bx, by = _pixel_to_base(u, v, PARCEL_PLANE_Z_BASE)
         bx += CAM_X_CORRECTION
         if bx < 0.0 or bx > 0.7:
@@ -286,7 +288,7 @@ class Scene1Runner:
         p = ikSolveParam()
         p.major_optimality_tol = 1e-3; p.major_feasibility_tol = 1e-3; p.minor_feasibility_tol = 1e-3
         p.major_iterations_limit = 500; p.oritation_constraint_tol = 1e-3; p.pos_constraint_tol = 1e-3
-        p.pos_cost_weight = 0.0; p.constraint_mode = constraint_mode
+        p.pos_cost_weight = 1.0; p.constraint_mode = constraint_mode
         req.ik_param = p
         req.use_custom_ik_param = True
         req.joint_angles_as_q0 = True
