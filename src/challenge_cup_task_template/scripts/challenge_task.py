@@ -218,11 +218,14 @@ class Scene1Runner:
             return q[12:26]
         raise RuntimeError("joint_q len %d" % len(q))
 
-    def move_arm_deg(self, arm_hold, target_deg, move_time=MOVE_TIME, settle=SETTLE):
+    def move_arm_deg(self, arm_hold, target_deg, move_time=MOVE_TIME, settle=SETTLE, lock_left=False):
         import rospy
         cur_rad = self.read_current_arm_rad()
         start = [math.degrees(v) for v in cur_rad]
         target = [float(v) for v in target_deg]
+        if lock_left:
+            # 严格锁左臂：左手 7 关节保持 start 值，只插值右手
+            target[:7] = start[:7]
         steps = max(1, int(round(move_time * ARM_TRAJ_HZ)))
         rate = rospy.Rate(ARM_TRAJ_HZ)
         for i in range(steps + 1):
@@ -343,7 +346,7 @@ class Scene1Runner:
         cur_deg = [math.degrees(v) for v in cur]
         q_deg = [math.degrees(v) for v in q]
         target = cur_deg[:7] + q_deg[7:14]
-        self.move_arm_deg(arm_hold, target)
+        self.move_arm_deg(arm_hold, target, lock_left=True)
         self.wait_converge(3.0)
 
     def right_grasp_to(self, arm_hold, ik_pos, quat):
