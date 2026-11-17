@@ -96,7 +96,16 @@ def detect_parcels(logfn):
     import cv2
     import numpy as np
     from sensor_msgs.msg import CompressedImage
-    msg = rospy.wait_for_message('/cam_h/color/image_raw/compressed', CompressedImage, timeout=15)
+    msg = None
+    for _attempt in range(3):
+        try:
+            msg = rospy.wait_for_message('/cam_h/color/image_raw/compressed', CompressedImage, timeout=15)
+            if msg is not None:
+                break
+        except Exception:
+            rospy.sleep(1.0)
+    if msg is None:
+        return []
     arr = np.frombuffer(msg.data, np.uint8)
     img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
     h, _ = img.shape[:2]
