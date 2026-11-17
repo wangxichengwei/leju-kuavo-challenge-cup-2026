@@ -440,7 +440,10 @@ class Scene1Runner:
         for k in range(1, int(n_points) + 1):
             a = float(k) / float(n_points)
             pt = [start[i] + (end[i] - start[i]) * a for i in range(3)]
-            q = self.call_ik(left_pos, left_quat, pt, quat, warm, constraint_mode=constraint_mode)
+            try:
+                q = self.call_ik(left_pos, left_quat, pt, quat, warm, constraint_mode=constraint_mode)
+            except RuntimeError:
+                q = self.call_ik(left_pos, left_quat, pt, quat, warm, constraint_mode=IK_MODE_THREE_POINT_MIXED)
             q_deg = [math.degrees(v) for v in q]
             joint_wps.append(left_deg + q_deg[7:14])
             warm = q
