@@ -364,11 +364,14 @@ class Scene1Runner:
                 best_area = stats[i][4]; best = i
         if best is None:
             return None
-        x, y, bw, bh, area = stats[best]
-        u, v = int(x+bw/2), int(y+bh/2)
-        d = depth[v, u]
-        if d <= 0 or d > 4000:
+        # 连通域内深度中位数（稳定，抗单像素噪声）+ 质心
+        zone = (labels == best)
+        ds = depth[zone]
+        ds = ds[(ds > 0) & (ds < 4000)]
+        if len(ds) < 10:
             return None
+        d = float(np.median(ds))
+        u = float(cents[best][0]); v = float(cents[best][1])
         dm = d / 1000.0
         xc = (u - CAM_CX) / CAM_FX * dm
         yc = (v - CAM_CY) / CAM_FY * dm
