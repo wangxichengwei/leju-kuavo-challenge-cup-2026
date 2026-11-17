@@ -424,6 +424,28 @@ class Scene1Runner:
                 constraint_mode=IK_MODE_THREE_POINT_MIXED,
                 lock_left_preset=False)
 
+    def move_right_cartesian_to(self, arm_hold, target_ik, quat, n_points=6,
+                                constraint_mode=IK_MODE_POS_HARD_ORI_HARD, seg_time=0.4):
+        """笛卡尔直线分段运动（对齐官方 _move_right_cartesian_to）：末端沿直线分 n 段，逐点单手 IK。"""
+        import rospy
+        cur = self.read_current_arm_rad()
+        fk = self.call_fk(cur, 5.0)
+        start = list(fk.right_pose.pos_xyz)
+        left_pos = list(fk.left_pose.pos_xyz)
+        left_quat = list(fk.left_pose.quat_xyzw)
+        end = [float(v) for v in target_ik]
+        warm = cur
+        left_deg = [math.degrees(v) for v in cur[:7]]
+        for k in range(1, int(n_points) + 1):
+            a = float(k) / float(n_points)
+            pt = [start[i] + (end[i] - start[i]) * a for i in range(3)]
+            q = self.call_ik(left_pos, left_quat, pt, quat, warm, constraint_mode=constraint_mode)
+            q_deg = [math.degrees(v) for v in q]
+            target = left_deg + q_deg[7:14]
+            self.move_arm_deg(arm_hold, target, move_time=seg_time, settle=0.4, lock_left=True)
+            warm = q
+        self.wait_converge(3.0)
+
     def world_to_ik(self, world):
         return [world[i] + WORLD_TO_IK_OFFSET[i] for i in range(3)]
 
