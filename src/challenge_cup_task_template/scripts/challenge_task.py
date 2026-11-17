@@ -343,6 +343,46 @@ class Scene1Runner:
                 else:
                     rospy.sleep(1.0)
 
+    def measure_weigh_center_3d(self):
+        """深度图实测称重区中心 base 3D 坐标（修正几何计算的偏差）。"""
+        import rospy, cv2, numpy as np
+        from sensor_msgs.msg import CompressedImage
+        color_msg = rospy.wait_for_message('/cam_h/color/image_raw/compressed', CompressedImage, timeout=10)
+        depth_msg = rospy.wait_for_message('/cam_h/depth/image_raw/compressedDepth', CompressedImage, timeout=10)
+        color = cv2.imdecode(np.frombuffer(color_msg.data, np.uint8), cv2.IMREAD_COLOR)
+        depth = cv2.imdecode(np.frombuffer(depth_msg.data[12:], np.uint8), cv2.IMREAD_UNCHANGED).astype(np.float32)
+        h, w = color.shape[:2]
+        hsv = cv2.cvtColor(color, cv2.COLOR_BGR2HSV)
+        H = hsv[:,:,0]; S = hsv[:,:,1]; V = hsv[:,:,2]
+        roi = np.zeros((h, w), np.uint8); roi[int(h*0.5):, int(w*0.5):] = 255
+        green = ((H>=40)&(H<=85)&(S>60)&(V>120)).astype(np.uint8)*255
+        green = cv2.bitwise_and(green, roi)
+        n, labels, stats, cents = cv2.connectedComponentsWithStats(green, 8)
+        best = None; best_area = 0
+        for i in range(1, n):
+            if stats[i][4] > best_area:
+                best_area = stats[i][4]; best = i
+        if best is None:
+            return None
+        x, y, bw, bh, area = stats[best]
+        u, v = int(x+bw/2), int(y+bh/2)
+        d = depth[v, u]
+        if d <= 0 or d > 4000:
+            return None
+        dm = d / 1000.0
+        xc = (u - CAM_CX) / CAM_FX * dm
+        yc = (v - CAM_CY) / CAM_FY * dm
+        zc = dm
+        pcam = np.array([xc, yc, zc])
+        qx, qy, qz, qw = CAM_QUAT
+        R = np.array([
+            [1-2*qy*qy-2*qz*qz, 2*qx*qy-2*qz*qw, 2*qx*qz+2*qy*qw],
+            [2*qx*qy+2*qz*qw, 1-2*qx*qx-2*qz*qz, 2*qy*qz-2*qx*qw],
+            [2*qx*qz-2*qy*qw, 2*qy*qz+2*qx*qw, 1-2*qx*qx-2*qy*qy],
+        ])
+        pbase = np.array(CAM_POS) + R @ pcam
+        return [float(pbase[0]), float(pbase[1]), float(pbase[2])]
+
     def call_ik(self, left_pos, left_quat, right_pos, right_quat, current_rad, timeout=5.0,
                 constraint_mode=IK_MODE_THREE_POINT_MIXED):
         import rospy
@@ -578,11 +618,19 @@ class Scene1Runner:
         # 抬升
         lift = [grasp[0], grasp[1], grasp[2] + LIFT_Z_OFFSET]
         self.right_arm_to(arm_hold, lift, self.right_pick_quat)
+        # 深度图实测称重区 3D，动态补偿释放点（修正几何偏差）
+        wc = self.measure_weigh_center_3d()
+        if wc is not None:
+            release = [wc[0], wc[1], WEIGH_RELEASE_IK[2]]
+            self.log("scene1 %s depth-servo weigh center=(%.3f,%.3f)", name, wc[0], wc[1])
+        else:
+            release = list(WEIGH_RELEASE_IK)
+            self.log("scene1 %s depth-servo failed, use geometry release", name)
         # 移到称重区上方
-        transit = [WEIGH_RELEASE_IK[0], WEIGH_RELEASE_IK[1], WEIGH_TRANSIT_IK_Z]
+        transit = [release[0], release[1], WEIGH_TRANSIT_IK_Z]
         self.right_arm_to(arm_hold, transit, self.weigh_release_quat)
         # 下降释放
-        self.right_arm_to(arm_hold, WEIGH_RELEASE_IK, self.weigh_release_quat)
+        self.right_arm_to(arm_hold, release, self.weigh_release_quat)
         rospy.sleep(1.5)
         self.set_gripper(GRIP_OPEN, GRIP_OPEN)  # 开爪称重
         rospy.sleep(1.0)
