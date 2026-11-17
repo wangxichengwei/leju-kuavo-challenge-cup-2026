@@ -37,8 +37,8 @@ RIGHT_PICK_OFFSET_FAR_ROW = [-0.03, 0.0, 0.0]
 RIGHT_PICK_OFFSET_NEAR_ROW = [-0.03, 0.02, -0.02]
 LIFT_Z_OFFSET = 0.30
 WEIGH_TRANSIT_IK_Z = 0.326217
-WEIGH_RELEASE_IK = [0.396, -0.574, 0.146217]
-WEIGH_REGRASP_IK = [0.396, -0.574, -0.04]
+WEIGH_RELEASE_IK = [0.42, -0.574, 0.146217]
+WEIGH_REGRASP_IK = [0.42, -0.574, -0.04]
 IK_MODE_POS_HARD_ORI_HARD = 0x03
 IK_MODE_THREE_POINT_MIXED = 0x06
 ARM_MODE_EXTERNAL_CONTROL = 2
@@ -323,20 +323,25 @@ class Scene1Runner:
             pass
         return None
 
-    def save_head_snapshot(self, path):
+    def save_head_snapshot(self, path, retries=3):
         import rospy
         import cv2
         import numpy as np
         from sensor_msgs.msg import CompressedImage
-        try:
-            m = rospy.wait_for_message("/cam_h/color/image_raw/compressed", CompressedImage, timeout=5.0)
-            a = np.frombuffer(m.data, np.uint8)
-            img = cv2.imdecode(a, cv2.IMREAD_COLOR)
-            if img is not None:
-                cv2.imwrite(path, img)
-                self.log("scene1 snapshot saved %s" % path)
-        except Exception as e:
-            self.log("scene1 snapshot failed %s" % e)
+        for attempt in range(retries):
+            try:
+                m = rospy.wait_for_message("/cam_h/color/image_raw/compressed", CompressedImage, timeout=5.0)
+                a = np.frombuffer(m.data, np.uint8)
+                img = cv2.imdecode(a, cv2.IMREAD_COLOR)
+                if img is not None:
+                    cv2.imwrite(path, img)
+                    self.log("scene1 snapshot saved %s" % path)
+                    return
+            except Exception as e:
+                if attempt == retries - 1:
+                    self.log("scene1 snapshot failed %s" % e)
+                else:
+                    rospy.sleep(1.0)
 
     def call_ik(self, left_pos, left_quat, right_pos, right_quat, current_rad, timeout=5.0,
                 constraint_mode=IK_MODE_THREE_POINT_MIXED):
@@ -462,7 +467,11 @@ class Scene1Runner:
         import numpy as np
         import tf
         from sensor_msgs.msg import CompressedImage
-        m = rospy.wait_for_message('/cam_r/color/image_raw/compressed', CompressedImage, timeout=8)
+        try:
+            m = rospy.wait_for_message('/cam_r/color/image_raw/compressed', CompressedImage, timeout=8)
+        except Exception as e:
+            self.log("wrist cam timeout, skip visual-servo: %s", e)
+            return None
         img = cv2.imdecode(np.frombuffer(m.data, np.uint8), cv2.IMREAD_COLOR)
         h, _ = img.shape[:2]
         hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
