@@ -240,9 +240,12 @@
 
 - 任务：6 零件分拣到 3 箱。类型映射（yaml 材质确认）：银白管件(A)→蓝箱、黑管件(B)→橙箱、红螺丝刀(C)→紫箱。
 - 布局：3 箱在桌面远端一字排开（紫/橙/蓝），零件在近端（画面底部，部分裁切）。
-- 检测原型验证：HSV 颜色分割可行——红螺丝刀 2/黑管件 2/银管件 2/蓝箱 1/紫箱 1 均能检测；橙箱阈值待调、背景有误检需 ROI 过滤。
-- 脚本：diag_scene2.py（探测）、detect_scene2.py（离线颜色分割）。
-- 下一步：调橙箱检测 + 写 scene2 完整检测函数（颜色分割+ROI+类型映射）+ 复用 scene1 抓取分拣管线。
+- 检测原型验证：HSV 颜色分割可行——3 箱（蓝/橙/紫）+ 6 零件（红2/黑2/银2）均能检测到 base 坐标；橙箱 bug 已修（面积阈值 20000→30000）；type=A 有 1 个螺丝刀银杆误检（待用"排除螺丝刀附近"处理）。
+- 完整检测函数：detect_scene2_full.py（颜色分割 → base 坐标 + 类型映射）。
+- 官方抓取姿态（scene2_part_grasp_ik.py）：A/B 管件 grasp pitch_adaptive=-π/4 + yaw_manual=π/2；C 螺丝刀额外 yaw_adaptive=-π/4。lift_pose pitch=-π/2。每零件有专属 grasp_offset_xyz_local。
+- **核心难点**：官方 yaw_adaptive 叠加在工件自身朝向（用 challenge_secret 上帝接口拿 yaw）；选手只能相机检测位置、拿不到精确朝向 → 需攻克"零件朝向检测"（形状/轮廓分析）。
+- 脚本：diag_scene2.py（探测）、detect_scene2.py（离线颜色分割）、detect_scene2_full.py（完整检测）。
+- 下一步：零件朝向检测（形状分析拿 yaw）→ 对应抓取姿态 → 复用 scene1 抓取分拣管线。
 ### 14.4 逐包裹闭爪诊断（diag_grasp_all.py，2026-11-17）
 
 vision MCP 对 4 个包裹「闭爪瞬间」手指 vs 包裹的判定（均未跨住包裹，偏约半个到一个盒身）：
