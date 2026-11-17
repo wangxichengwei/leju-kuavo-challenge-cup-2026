@@ -243,7 +243,7 @@
 - 检测原型验证：HSV 颜色分割可行——3 箱（蓝/橙/紫）+ 6 零件（红2/黑2/银2）均能检测到 base 坐标；橙箱 bug 已修（面积阈值 20000→30000）；type=A 有 1 个螺丝刀银杆误检（待用"排除螺丝刀附近"处理）。
 - 完整检测函数：detect_scene2_full.py（颜色分割 → base 坐标 + 类型映射）。
 - 官方抓取姿态（scene2_part_grasp_ik.py）：A/B 管件 grasp pitch_adaptive=-π/4 + yaw_manual=π/2；C 螺丝刀额外 yaw_adaptive=-π/4。lift_pose pitch=-π/2。每零件有专属 grasp_offset_xyz_local。
-- **核心难点**：官方 yaw_adaptive 叠加在工件自身朝向（用 challenge_secret 上帝接口拿 yaw）；选手只能相机检测位置、拿不到精确朝向 → 需攻克"零件朝向检测"（形状/轮廓分析）。
+- **核心难点已解**：官方 A/B 管件 yaw_adaptive=0（固定姿态，不需朝向），仅 C 螺丝刀需要朝向。朝向检测用 PCA 主轴：螺丝刀长宽比 6.9~14.5（PCA 可靠）；管件长宽比 1.2~3.1（不需朝向）；螺丝刀银杆长宽比 205 可识别排除。
 - 脚本：diag_scene2.py（探测）、detect_scene2.py（离线颜色分割）、detect_scene2_full.py（完整检测）。
 - 下一步：零件朝向检测（形状分析拿 yaw）→ 对应抓取姿态 → 复用 scene1 抓取分拣管线。
 ### 14.4 逐包裹闭爪诊断（diag_grasp_all.py，2026-11-17）
