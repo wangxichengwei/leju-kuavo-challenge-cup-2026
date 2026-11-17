@@ -195,12 +195,49 @@ class ArmHold:
                 break
 
 
+class GripperHold:
+    """持续发布夹爪命令（对齐官方 GripperHold），避免发几次就停导致闭合不稳定。"""
+    def __init__(self, pub, left, right):
+        self._pub = pub
+        self._lock = threading.Lock()
+        self._left = float(left)
+        self._right = float(right)
+        self._stop = threading.Event()
+        self._thr = threading.Thread(target=self._run, daemon=True)
+
+    def start(self):
+        self._thr.start()
+
+    def set_command(self, left, right):
+        with self._lock:
+            self._left = float(left)
+            self._right = float(right)
+
+    def _run(self):
+        import rospy
+        from sensor_msgs.msg import JointState
+        r = rospy.Rate(20.0)
+        while not self._stop.is_set() and not rospy.is_shutdown():
+            with self._lock:
+                left = self._left
+                right = self._right
+            m = JointState(); m.header.stamp = rospy.Time.now()
+            m.name = ["left_gripper_joint", "right_gripper_joint"]
+            m.position = [left, right]
+            try:
+                self._pub.publish(m); r.sleep()
+            except rospy.ROSException:
+                break
+
+
 class Scene1Runner:
     def __init__(self):
         import rospy
         from sensor_msgs.msg import JointState
         self.arm_pub = rospy.Publisher("/kuavo_arm_traj", JointState, queue_size=10)
         self.gripper_pub = rospy.Publisher("/gripper/command", JointState, queue_size=10)
+        self.gripper_hold = GripperHold(self.gripper_pub, GRIP_OPEN, GRIP_OPEN)
+        self.gripper_hold.start()
         self.right_pick_quat = quat_from_ypr(RIGHT_PICK_FIRST_YPR, RIGHT_PICK_SECOND_YPR)
         self.weigh_release_quat = quat_from_ypr(WEIGH_RELEASE_FIRST_YPR, WEIGH_RELEASE_SECOND_YPR)
         self.weigh_regrasp_quat = quat_from_ypr(WEIGH_REGRASP_FIRST_YPR, WEIGH_REGRASP_SECOND_YPR)
@@ -235,13 +272,32 @@ class Scene1Runner:
                 rate.sleep()
         rospy.sleep(settle)
 
-    def set_gripper(self, left, right):
+    def set_gripper(self, left, right, hold_time=0.0):
+        """更新持续 hold 的命令值；hold_time>0 时等待该时长（闭爪保持）。"""
+        self.gripper_hold.set_command(left, right)
+        if hold_time > 0:
+            import rospy
+            rospy.sleep(hold_time)
+
+    def wait_gripper(self, side, target, tolerance=0.05, timeout=3.0):
+        """读 /gripper/state 确认夹爪到达目标（对齐官方 _wait_for_gripper_open）。"""
         import rospy
         from sensor_msgs.msg import JointState
-        m = JointState(); m.header.stamp = rospy.Time.now()
-        m.name = ["left_gripper_joint", "right_gripper_joint"]; m.position = [float(left), float(right)]
-        for _ in range(5):
-            self.gripper_pub.publish(m); rospy.sleep(0.05)
+        name = side + "_gripper_joint"
+        deadline = rospy.Time.now() + rospy.Duration(float(timeout))
+        while not rospy.is_shutdown() and rospy.Time.now() < deadline:
+            try:
+                msg = rospy.wait_for_message("/gripper/state", JointState, timeout=0.2)
+            except rospy.ROSException:
+                continue
+            if name not in msg.name:
+                continue
+            i = msg.name.index(name)
+            if i >= len(msg.position):
+                continue
+            if abs(float(msg.position[i]) - float(target)) <= tolerance:
+                return True
+        return False
 
     def set_arm_mode(self, mode=ARM_MODE_EXTERNAL_CONTROL, timeout=10.0):
         import rospy
