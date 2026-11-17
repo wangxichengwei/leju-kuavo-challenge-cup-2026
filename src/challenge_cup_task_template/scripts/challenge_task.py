@@ -347,8 +347,18 @@ class Scene1Runner:
         """深度图实测称重区中心 base 3D 坐标（修正几何计算的偏差）。"""
         import rospy, cv2, numpy as np
         from sensor_msgs.msg import CompressedImage
-        color_msg = rospy.wait_for_message('/cam_h/color/image_raw/compressed', CompressedImage, timeout=10)
-        depth_msg = rospy.wait_for_message('/cam_h/depth/image_raw/compressedDepth', CompressedImage, timeout=10)
+        color_msg = None
+        depth_msg = None
+        for _attempt in range(3):
+            try:
+                color_msg = rospy.wait_for_message('/cam_h/color/image_raw/compressed', CompressedImage, timeout=6)
+                depth_msg = rospy.wait_for_message('/cam_h/depth/image_raw/compressedDepth', CompressedImage, timeout=6)
+                if color_msg is not None and depth_msg is not None:
+                    break
+            except Exception:
+                rospy.sleep(1.0)
+        if color_msg is None or depth_msg is None:
+            return None
         color = cv2.imdecode(np.frombuffer(color_msg.data, np.uint8), cv2.IMREAD_COLOR)
         depth = cv2.imdecode(np.frombuffer(depth_msg.data[12:], np.uint8), cv2.IMREAD_UNCHANGED).astype(np.float32)
         h, w = color.shape[:2]
