@@ -426,7 +426,7 @@ class Scene1Runner:
 
     def move_right_cartesian_to(self, arm_hold, target_ik, quat, n_points=6,
                                 constraint_mode=IK_MODE_POS_HARD_ORI_HARD, seg_time=0.4):
-        """笛卡尔直线分段运动（对齐官方 _move_right_cartesian_to）：末端沿直线分 n 段，逐点单手 IK。"""
+        """笛卡尔直线分段运动（对齐官方 _move_right_cartesian_to）：末端沿直线分 n 段，逐点单手 IK，样条式连续下发。"""
         import rospy
         cur = self.read_current_arm_rad()
         fk = self.call_fk(cur, 5.0)
@@ -436,14 +436,25 @@ class Scene1Runner:
         end = [float(v) for v in target_ik]
         warm = cur
         left_deg = [math.degrees(v) for v in cur[:7]]
+        joint_wps = [[math.degrees(v) for v in cur]]
         for k in range(1, int(n_points) + 1):
             a = float(k) / float(n_points)
             pt = [start[i] + (end[i] - start[i]) * a for i in range(3)]
             q = self.call_ik(left_pos, left_quat, pt, quat, warm, constraint_mode=constraint_mode)
             q_deg = [math.degrees(v) for v in q]
-            target = left_deg + q_deg[7:14]
-            self.move_arm_deg(arm_hold, target, move_time=seg_time, settle=0.4, lock_left=True)
+            joint_wps.append(left_deg + q_deg[7:14])
             warm = q
+        # 连续下发（段间线性插值，不停顿），对齐官方样条流式下发
+        rate = rospy.Rate(ARM_TRAJ_HZ)
+        for i in range(1, len(joint_wps)):
+            steps = max(1, int(round(seg_time * ARM_TRAJ_HZ)))
+            for s in range(steps + 1):
+                a = float(s) / steps
+                interp = [joint_wps[i-1][j] + (joint_wps[i][j] - joint_wps[i-1][j]) * a for j in range(14)]
+                arm_hold.set_degrees(interp)
+                if s < steps:
+                    rate.sleep()
+        rospy.sleep(0.8)  # 官方 SCENE1_ARM_SETTLE_TIME
         self.wait_converge(3.0)
 
     def world_to_ik(self, world):
