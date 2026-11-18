@@ -32,11 +32,11 @@ GRIP_OPEN = 0.0
 GRIP_CLOSE = 255.0
 RIGHT_PICK_IK_Z = -0.03
 # 深度抓取：末端相对包裹顶面下压量（指尖比末端低约 4.7cm）
-GRASP_BELOW_TOP = 0.02
+GRASP_BELOW_TOP = 0.07
 RIGHT_PICK_TRANSIT_IK_Z = 0.12
 RIGHT_PICK_NEAR_FAR_Y_THRESHOLD = -0.20
-RIGHT_PICK_OFFSET_FAR_ROW = [-0.03, 0.0, 0.0]
-RIGHT_PICK_OFFSET_NEAR_ROW = [-0.03, 0.02, -0.02]
+RIGHT_PICK_OFFSET_FAR_ROW = [-0.047, 0.02, 0.0]
+RIGHT_PICK_OFFSET_NEAR_ROW = [-0.047, 0.0, 0.03]
 LIFT_Z_OFFSET = 0.30
 WEIGH_TRANSIT_IK_Z = 0.326217
 WEIGH_RELEASE_IK = [0.40, -0.574, 0.146217]
@@ -444,6 +444,9 @@ class Scene1Runner:
             [2*qx*qz-2*qy*qw, 2*qy*qz+2*qx*qw, 1-2*qx*qx-2*qy*qy],
         ])
         pbase = np.array(CAM_POS) + R @ pcam
+        # 合理性校验：称重区应在右前下方，排除误检到的绿色物体
+        if not (0.30 <= pbase[0] <= 0.58 and -0.78 <= pbase[1] <= -0.42):
+            return None
         return [float(pbase[0]), float(pbase[1]), float(pbase[2])]
 
     def call_ik(self, left_pos, left_quat, right_pos, right_quat, current_rad, timeout=5.0,
@@ -491,7 +494,7 @@ class Scene1Runner:
 
     # 右手到目标位姿（左手锁官方等待位，避免联合IK无解）
     def right_arm_to(self, arm_hold, ik_pos, quat,
-                     constraint_mode=IK_MODE_THREE_POINT_MIXED, lock_left_preset=False):
+                     constraint_mode=IK_MODE_THREE_POINT_MIXED, lock_left_preset=True):
         cur = self.read_current_arm_rad()
         if lock_left_preset:
             if not hasattr(self, "_left_quat_fixed"):
@@ -519,13 +522,13 @@ class Scene1Runner:
             self.right_arm_to(
                 arm_hold, ik_pos, quat,
                 constraint_mode=IK_MODE_POS_HARD_ORI_HARD,
-                lock_left_preset=False)
+                lock_left_preset=True)
         except RuntimeError as exc:
             self.log("scene1 hard grasp IK failed, fallback to mixed IK: %s" % exc)
             self.right_arm_to(
                 arm_hold, ik_pos, quat,
                 constraint_mode=IK_MODE_THREE_POINT_MIXED,
-                lock_left_preset=False)
+                lock_left_preset=True)
 
     def move_right_cartesian_to(self, arm_hold, target_ik, quat, n_points=6,
                                 constraint_mode=IK_MODE_POS_HARD_ORI_HARD, seg_time=0.4):
@@ -661,7 +664,8 @@ class Scene1Runner:
             self._head_snap_done = True
             self.save_head_snapshot("/tmp/pregrasp_head.png")
         # 视觉伺服：腕相机检测快递，校正抓取 x/y
-        wb = self.wrist_parcel_base()
+        # 注意：深度定位准确时不再用腕相机（它容易误检到已搬走的包裹，反而把坐标带偏）
+        wb = None if z_top is not None else self.wrist_parcel_base()
         if wb is not None:
             dx = wb[0] - px
             dy = wb[1] - py
@@ -678,10 +682,74 @@ class Scene1Runner:
         # 下降抓取
         grasp = [px, py, pz]
         self.right_grasp_to(arm_hold, grasp, self.right_pick_quat)
+        # 抓取前记录夹爪状态（确认下探时是张开的）
+        try:
+            _g0 = self.read_gripper_state()
+            self.log("scene1 %s PRE_GRASP gripper=%s", name, str(round(_g0, 4)) if _g0 is not None else "None")
+        except Exception:
+            pass
+        # FK 闭环：实测末端位置与目标的偏差，阻尼迭代修正（只补 60% 防震荡）
+        for _it in range(3):
+            try:
+                _fk = self.call_fk(self.read_current_arm_rad(20), 8.0)
+                _p = list(_fk.right_pose.pos_xyz)
+            except Exception as _e:
+                self.log("scene1 %s FK check fail: %s", name, _e)
+                break
+            ex = grasp[0] - _p[0]; ey = grasp[1] - _p[1]; ez = grasp[2] - _p[2]
+            _e3 = math.sqrt(ex * ex + ey * ey + ez * ez)
+            self.log("scene1 %s FK iter%d actual=(%.3f,%.3f,%.3f) target=(%.3f,%.3f,%.3f) err=%.1fmm",
+                     name, _it, _p[0], _p[1], _p[2], grasp[0], grasp[1], grasp[2], 1000.0 * _e3)
+            if _e3 < 0.008:
+                break
+            # 阻尼修正：只补 60%，避免 overshoot 震荡
+            self.right_grasp_to(arm_hold,
+                                [grasp[0] + 0.6 * ex, grasp[1] + 0.6 * ey, grasp[2] + 0.6 * ez],
+                                self.right_pick_quat)
+        try:
+            self.save_head_snapshot("/tmp/grasp_at_%s.png" % name)
+        except Exception:
+            pass
         self.set_gripper(GRIP_OPEN, GRIP_CLOSE)  # 右手闭
         import rospy; rospy.sleep(1.0)
         g = self.read_gripper_state()
         self.log("scene1 %s GRASP_CHECK right_gripper=%s (0.8 means empty grasp)" % (name, str(round(g, 4)) if g is not None else "None"))
+        # 抓空自校正：抬高一点重试（应对下探过深、指尖滑到盒底以下）
+        for _try in range(3):
+            if g is None or g < 0.55:
+                break
+            self.set_gripper(GRIP_OPEN, GRIP_OPEN)
+            import rospy as _rp; _rp.sleep(0.8)
+            # 重新视觉检测：首次下探可能把盒子推走了（真正的视觉闭环）
+            _best = None; _bd = 1e9
+            try:
+                for _c in detect_parcels(self.log):
+                    _cz = _c[2] if len(_c) > 2 else None
+                    # 过滤桌面/地面误检（z 明显低于包裹顶面，包裹顶面约 0~0.06m）
+                    if _cz is not None and _cz < -0.005:
+                        continue
+                    _d = math.sqrt((_c[0] - grasp[0]) ** 2 + (_c[1] - grasp[1]) ** 2)
+                    if _d < _bd:
+                        _bd = _d; _best = _c
+            except Exception as _de:
+                self.log("scene1 %s re-detect fail: %s" % (name, _de))
+            if _best is not None and _bd < 0.10 and _best[2] is not None:
+                _retry = [_best[0], _best[1], _best[2] - GRASP_BELOW_TOP + 0.012]
+                self.log("scene1 %s retry#%d box moved %.0fmm -> re-grasp (%.3f,%.3f)"
+                         % (name, _try + 1, _bd * 1000.0, _retry[0], _retry[1]))
+            else:
+                _retry = [grasp[0], grasp[1], grasp[2] + 0.012]
+                self.log("scene1 %s retry#%d no valid re-detect, z+0.012" % (name, _try + 1))
+            try:
+                self.right_arm_to(arm_hold, [_retry[0], _retry[1], RIGHT_PICK_TRANSIT_IK_Z], self.right_pick_quat)
+                self.right_grasp_to(arm_hold, _retry, self.right_pick_quat)
+                self.set_gripper(GRIP_OPEN, GRIP_CLOSE)
+                _rp.sleep(1.0)
+                g = self.read_gripper_state()
+                self.log("scene1 %s retry#%d GRASP=%s" % (name, _try + 1, str(round(g, 4)) if g is not None else "None"))
+            except Exception as _re:
+                self.log("scene1 %s retry#%d fail: %s", name, _try + 1, _re)
+                break
         # 抬升
         lift = [grasp[0], grasp[1], grasp[2] + LIFT_Z_OFFSET]
         self.right_arm_to(arm_hold, lift, self.right_pick_quat)
