@@ -46,6 +46,15 @@ RIGHT_HANDOFF_TRANSIT_IK_Z = 0.40
 LEFT_HANDOFF_RECEIVE_IK = [0.266, 0.04645, 0.2216983]
 BOX_DROP_IK = [0.605966, 0.226114, 0.556217]
 PLACE_APPROACH_Z_OFFSET = 0.060
+# ===== scene2 零件分拣 =====
+SCENE2_GRASP_A_B_QUAT = None  # 占位，实际用 quat_from_ypr([0,-45,0],[90,0,0])
+SCENE2_PLACE_JOINTS = {
+    ("right", "A"): [-30, -10, -10, -80, 70, 0, 0],
+    ("right", "B"): [-30, 0, 30, -80, 70, 0, 0],
+    ("left", "B"): [-30, 0, -30, -80, -70, 0, 0],
+    ("left", "C"): [-30, 10, 10, -80, -70, 0, 0],
+}
+SCENE2_BIN_TARGET_ARM = {"A": "right", "B": None, "C": "left"}  # B 按零件 y 分左右手
 WEIGH_REGRASP_IK = [0.40, -0.574, -0.04]
 IK_MODE_POS_HARD_ORI_HARD = 0x03
 IK_MODE_THREE_POINT_MIXED = 0x06
@@ -184,6 +193,72 @@ def detect_parcels(logfn):
     logfn("scene1 detect: %d parcels %s", len(found),
           [(round(a, 3), round(b, 3), (round(c, 3) if c is not None else None)) for a, b, c in found])
     return found
+
+
+def detect_scene2_parts(logfn):
+    """scene2 检测：颜色分割 + 深度定位 -> parts=[(type,x,y,z),...], bins={type:(x,y,z)}。"""
+    import rospy, cv2, numpy as np
+    from sensor_msgs.msg import CompressedImage
+    cm = None; dm = None
+    for _a in range(3):
+        try:
+            cm = rospy.wait_for_message('/cam_h/color/image_raw/compressed', CompressedImage, timeout=15)
+            dm = rospy.wait_for_message('/cam_h/depth/image_raw/compressedDepth', CompressedImage, timeout=15)
+            if cm is not None and dm is not None:
+                break
+        except Exception:
+            rospy.sleep(1.0)
+    if cm is None:
+        return [], {}
+    color = cv2.imdecode(np.frombuffer(cm.data, np.uint8), cv2.IMREAD_COLOR)
+    depth = cv2.imdecode(np.frombuffer(dm.data[12:], np.uint8), cv2.IMREAD_UNCHANGED).astype(np.float32)
+    h, w = color.shape[:2]
+    hsv = cv2.cvtColor(color, cv2.COLOR_BGR2HSV)
+    H = hsv[:,:,0]; S = hsv[:,:,1]; V = hsv[:,:,2]
+
+    def to3d(u, v):
+        p = _pixel_depth_to_base(u, v, depth)
+        # 零件在桌面附近（z -0.25~0.15），排除胸前手臂（z>0.3）和地面
+        if p is not None and -0.25 <= p[2] <= 0.15:
+            return p
+        return None
+
+    def blobs(mask, area_lo, area_hi, min_aspect=None, max_aspect=None):
+        k = np.ones((5, 5), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k)
+        n, labels, stats, cents = cv2.connectedComponentsWithStats(mask, 8)
+        out = []
+        for i in range(1, n):
+            x, y, bw, bh, area = stats[i]
+            if area < area_lo or area > area_hi:
+                continue
+            aspect = max(bw, bh) / float(max(min(bw, bh), 1))
+            if min_aspect is not None and aspect < min_aspect:
+                continue
+            if max_aspect is not None and aspect > max_aspect:
+                continue
+            u, v = cents[i]
+            p = to3d(u, v)
+            if p is not None:
+                out.append((p, int(area)))
+        return out
+
+    red = ((H < 10) | (H > 170)) & (S > 80) & (V > 60)
+    black = (V < 90) & (S < 100)
+    silver = (S < 60) & (V > 120)
+
+    parts = []
+    for p, area in blobs(red.astype(np.uint8) * 255, 200, 4000):
+        parts.append(("C", p[0], p[1], p[2]))
+    for p, area in blobs(black.astype(np.uint8) * 255, 200, 4000):
+        parts.append(("B", p[0], p[1], p[2]))
+    # A 银管件：长宽比 <6 排除细长的螺丝刀银杆（长宽比 ~205）
+    for p, area in blobs(silver.astype(np.uint8) * 255, 400, 4000, max_aspect=6.0):
+        parts.append(("A", p[0], p[1], p[2]))
+    parts.sort(key=lambda t: (t[1], t[2]))
+    logfn("scene2 detect: %d parts %s", len(parts), [(t, round(x, 3), round(y, 3)) for t, x, y, z in parts])
+    return parts, {}
 
 
 def _matmul3(a, b):
@@ -575,6 +650,17 @@ class Scene1Runner:
         self.set_gripper(GRIP_CLOSE, GRIP_OPEN)
         rospy.sleep(0.8)
         self.log("scene1 %s handoff: 左手已接", name)
+        try:
+            self.save_head_snapshot("/tmp/handoff_%s.png" % name)
+        except Exception:
+            pass
+        try:
+            _fk = self.call_fk(self.read_current_arm_rad(20), 8.0)
+            _lp = list(_fk.left_pose.pos_xyz); _rp = list(_fk.right_pose.pos_xyz)
+            self.log("scene1 %s handoff后 左手FK=(%.3f,%.3f,%.3f) 右手FK=(%.3f,%.3f,%.3f)",
+                     name, _lp[0], _lp[1], _lp[2], _rp[0], _rp[1], _rp[2])
+        except Exception:
+            pass
         # 4. 右手退让抬升
         self.right_arm_to(arm_hold,
                           [RIGHT_HANDOFF_TO_LEFT_IK[0], RIGHT_HANDOFF_TO_LEFT_IK[1], RIGHT_HANDOFF_TRANSIT_IK_Z], hq)
@@ -585,6 +671,11 @@ class Scene1Runner:
         self.set_gripper(GRIP_OPEN, GRIP_OPEN)
         rospy.sleep(1.0)
         self.log("scene1 %s box drop done", name)
+        # 入箱后拍快照（验证包裹是否进箱）
+        try:
+            self.save_head_snapshot("/tmp/box_drop_%s.png" % name)
+        except Exception:
+            pass
         # 6. 双臂回预设位（让出头部相机视野，否则下一轮检测不到包裹）
         try:
             self.move_arm_deg(arm_hold, PRESET_FINAL_DEG, move_time=2.0, settle=1.0)
@@ -862,8 +953,99 @@ def _load_launcher():
     return ChallengeSimLauncher
 
 
+def run_scene2(seed, time_limit=None, timer_gui=True):
+    """scene2 零件分拣：检测 6 零件 -> 按类型抓取 -> 放对应箱。"""
+    import rospy
+    import math as _m
+    stood = {"ok": False}
+    def _cb(msg):
+        stood["ok"] = True
+    rospy.Subscriber("/bot_stand_up_complete", rospy.AnyMsg, _cb, queue_size=5)
+    ChallengeSimLauncher = _load_launcher()
+    launcher = ChallengeSimLauncher(scene="scene2", seed=seed, match_time_limit=time_limit or 0, timer_gui=timer_gui)
+    launcher.start(node_name="challenge_task_scene2", timeout=120)
+    rospy.loginfo("scene2 启动 seed=%s", seed)
+    runner = Scene1Runner()
+    t0 = rospy.Time.now()
+    while not stood["ok"] and (rospy.Time.now() - t0).to_sec() < 150:
+        rospy.sleep(0.5)
+    rospy.loginfo("scene2 stand-up=%s", stood["ok"])
+    rospy.sleep(4.0)
+    runner.set_arm_mode(ARM_MODE_EXTERNAL_CONTROL, 20.0)
+    arm_pub = runner.arm_pub
+    cur = runner.read_current_arm_rad(90.0)
+    arm_hold = ArmHold(arm_pub, [_m.degrees(v) for v in cur])
+    arm_hold.start()
+    rospy.sleep(0.5)
+    runner.move_arm_deg(arm_hold, PRESET_FINAL_DEG, move_time=2.0, settle=1.2)
+    runner.set_gripper(GRIP_OPEN, GRIP_OPEN)
+
+    parts, _bins = detect_scene2_parts(rospy.loginfo)
+    if not parts:
+        rospy.logwarn("scene2 未检测到零件")
+        return
+    quat_grasp = quat_from_ypr([0, -45, 0], [90, 0, 0])  # pitch=-45 抓取姿态
+    for idx, part in enumerate(parts):
+        t, x, y, z = part
+        arm = SCENE2_BIN_TARGET_ARM.get(t, "right")
+        if arm is None:
+            # B 按零件 y 分左右手（y<0 右手，y>0 左手）
+            arm = "right" if y < 0 else "left"
+        name = "part_%s_%d" % (t, idx)
+        # 抓取点：深度定位中心 + 手指补偿（抓取姿态手指 +x 47mm）
+        gx, gy, gz = x - 0.047, y, z + 0.01
+        try:
+            if arm == "right":
+                runner.right_arm_to(arm_hold, [gx, gy, RIGHT_PICK_TRANSIT_IK_Z], quat_grasp)
+                runner.right_grasp_to(arm_hold, [gx, gy, gz], quat_grasp)
+                runner.set_gripper(GRIP_OPEN, GRIP_CLOSE)
+            else:
+                runner.left_arm_to(arm_hold, [gx, gy, RIGHT_PICK_TRANSIT_IK_Z], quat_grasp)
+                runner.left_arm_to(arm_hold, [gx, gy, gz], quat_grasp)
+                runner.set_gripper(GRIP_CLOSE, GRIP_OPEN)
+            rospy.sleep(1.0)
+            g = runner.read_gripper_state()
+            rospy.loginfo("scene2 %s GRASP=%s", name, str(round(g, 4)) if g is not None else "None")
+            # 抬升
+            lift = [gx, gy, gz + LIFT_Z_OFFSET]
+            if arm == "right":
+                runner.right_arm_to(arm_hold, lift, quat_grasp)
+            else:
+                runner.left_arm_to(arm_hold, lift, quat_grasp)
+            # 放箱（关节空间固定姿态）
+            pj = SCENE2_PLACE_JOINTS.get((arm, t))
+            if pj is not None:
+                # 下发对应臂的放置关节（另一臂保持当前）
+                cur2 = runner.read_current_arm_rad(20)
+                cur2_deg = [_m.degrees(v) for v in cur2]
+                if arm == "right":
+                    full = cur2_deg[:7] + pj
+                else:
+                    full = pj + cur2_deg[7:14]
+                runner.move_arm_deg(arm_hold, full, move_time=2.0, settle=1.0)
+                rospy.sleep(0.5)
+                runner.set_gripper(GRIP_OPEN, GRIP_OPEN)
+                rospy.loginfo("scene2 %s 已放箱 %s", name, t)
+            # 归位
+            runner.move_arm_deg(arm_hold, PRESET_FINAL_DEG, move_time=2.0, settle=1.0)
+            runner.set_gripper(GRIP_OPEN, GRIP_OPEN)
+        except Exception as e:
+            rospy.logerr("scene2 %s 失败: %s", name, e)
+            try:
+                runner.move_arm_deg(arm_hold, PRESET_FINAL_DEG, move_time=2.0, settle=1.0)
+            except Exception:
+                pass
+    rospy.loginfo("scene2 试点结束")
+    rospy.sleep(2.0)
+    if time_limit:
+        rospy.signal_shutdown("done")
+
+
 def run_scene(scene, seed, time_limit=None, timer_gui=True):
     import rospy
+    if scene == "scene2":
+        run_scene2(seed, time_limit=time_limit, timer_gui=timer_gui)
+        return
     ChallengeSimLauncher = _load_launcher()
     launcher = ChallengeSimLauncher(scene=scene, seed=seed, match_time_limit=time_limit or 0, timer_gui=timer_gui)
     launcher.start(node_name="challenge_task_scene1", timeout=120)
