@@ -300,3 +300,44 @@ vision MCP 对 4 个包裹「闭爪瞬间」手指 vs 包裹的判定（均未�
 - Codex 的 right_grasp_to 是双臂联合 IK（左手锁 LEFT_PRESET_2_IK 常量），且 0x03 在 detect 目标上频繁无解回退 0x06。
 
 下一步（明确）：对齐官方单手 IK——右手目标 + 左手锁当前 FK + 0x03 硬约束 + 只取右手关节；并确保 detect 目标落在 0x03 硬约束可达范围（必要时 clamp）。
+
+
+## 18. 云主机 GPU 迁移（2026-11-18，成功）
+
+### 背景
+本地相机只有 **0.1 Hz**（10 秒一帧），视觉伺服/深度伺服无法闭环。根因实测：
+MPC(1000Hz)+WBC+MuJoCo 物理+渲染共抢占 **9~12 个 CPU 线程**，渲染线程被饿死；
+本地内存 5.7GB 并非瓶颈（峰值仅 2.75GB）。
+
+### 结果
+| 指标 | 本地（软件渲染） | 云主机 A100（GPU 渲染） |
+|---|---|---|
+| 相机频率 | **0.1 Hz** | **27.8~29.1 Hz**（约 290 倍） |
+| GPU 利用率 | — | 33%，显存 1105MiB，40.7W |
+| 容器 CPU | 917~1165% | 737% |
+| 容器内存 | 2.75 GiB | 1.8 GiB |
+| scene1 全程耗时 | ~8 分钟 | **~5 分钟** |
+
+### 关键点（排错顺序）
+1. **驱动**：`nvidia-driver-580-server`；扩容重启会打断 DKMS 编译，
+   `nvidia.ko` 变 0 字节但 `dkms status` 仍报 installed → 必须
+   `dkms remove` + `dkms install --force` + `depmod` 重编。
+2. **Docker**：`docker.io 29.1.3`；重启后 daemon 会 failed，需手动 start。
+3. **网络限制**：github.com / Docker Hub 不可达，但 **nvidia.github.io 可达**，
+   toolkit(1.20.2) 可正常装；镜像必须本地 `docker save | gzip | ssh "gunzip | docker load"` 流式传。
+4. **镜像不含 /root/kuavo_ws**（本地是 bind mount）→ 工作区单独传（排除 build/docs/logs，4.0GB）。
+5. **核心：MuJoCo 走 GLFW→GLX，不是 EGL**。Xvfb 只有 llvmpipe 软件渲染，
+   必须给 A100 配 GPU 后端 Xorg：
+   - `ModulePath` 指向 `/usr/lib/x86_64-linux-gnu/nvidia/xorg`
+   - **不要写** `Option "UseDisplayDevice" "none"`（会报 virtual display 冲突 → no screens found）
+   - 启动后 `DISPLAY=:2 glxinfo -B` → `NVIDIA A100-PCIE-40GB/PCIe/SSE2`
+
+### 复现命令
+详见 `云主机部署记录.md`（agent/20261115-kuavo-config 目录）。
+
+### 当前状态与下一步
+- GPU 环境已就绪，scene1 可端到端跑（检测到 4 个包裹，5 分钟跑完）。
+- 抓取质量仍不稳定（4 个包裹 GRASP=0.73/0.74/0.73/0.31，仅 1 个真正落入称重区），
+  说明抓取补偿参数是按本地时序调的，GPU 环境需重新标定。
+- **下一步（最大收益）**：29Hz 相机让视觉伺服闭环终于可行——
+  scene1 释放伺服、scene2 抓取伺服都可以真正闭环了。
