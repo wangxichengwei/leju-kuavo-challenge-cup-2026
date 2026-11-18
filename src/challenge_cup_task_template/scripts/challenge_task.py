@@ -31,6 +31,8 @@ SETTLE = 0.8
 GRIP_OPEN = 0.0
 GRIP_CLOSE = 255.0
 RIGHT_PICK_IK_Z = -0.03
+# 深度抓取：末端相对包裹顶面下压量（指尖比末端低约 4.7cm）
+GRASP_BELOW_TOP = 0.02
 RIGHT_PICK_TRANSIT_IK_Z = 0.12
 RIGHT_PICK_NEAR_FAR_Y_THRESHOLD = -0.20
 RIGHT_PICK_OFFSET_FAR_ROW = [-0.03, 0.0, 0.0]
@@ -91,16 +93,43 @@ def _pixel_to_base(u, v, zplane):
     return [CAM_POS[0]+t*dbase[0], CAM_POS[1]+t*dbase[1]]
 
 
+def _pixel_depth_to_base(u, v, depth):
+    """像素 + 深度图 -> base 3D 坐标（米）。depth 为 uint16 毫米数组。"""
+    if depth is None:
+        return None
+    h, w = depth.shape[:2]
+    iu, iv = int(round(u)), int(round(v))
+    if iu < 1 or iv < 1 or iu >= w - 1 or iv >= h - 1:
+        return None
+    vals = []
+    for dv in (-1, 0, 1):
+        for du in (-1, 0, 1):
+            d = float(depth[iv + dv, iu + du])
+            if 0 < d < 4000:
+                vals.append(d)
+    if not vals:
+        return None
+    vals.sort()
+    dmm = vals[len(vals) // 2]
+    dm = dmm / 1000.0
+    xc = (u - CAM_CX) / CAM_FX * dm
+    yc = (v - CAM_CY) / CAM_FY * dm
+    p = _rot_vec([xc, yc, dm], CAM_QUAT)
+    return [CAM_POS[0] + p[0], CAM_POS[1] + p[1], CAM_POS[2] + p[2]]
+
+
 def detect_parcels(logfn):
     import rospy
     import cv2
     import numpy as np
     from sensor_msgs.msg import CompressedImage
     msg = None
+    dmsg = None
     for _attempt in range(3):
         try:
             msg = rospy.wait_for_message('/cam_h/color/image_raw/compressed', CompressedImage, timeout=15)
-            if msg is not None:
+            dmsg = rospy.wait_for_message('/cam_h/depth/image_raw/compressedDepth', CompressedImage, timeout=15)
+            if msg is not None and dmsg is not None:
                 break
         except Exception:
             rospy.sleep(1.0)
@@ -108,6 +137,12 @@ def detect_parcels(logfn):
         return []
     arr = np.frombuffer(msg.data, np.uint8)
     img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    depth = None
+    if dmsg is not None:
+        try:
+            depth = cv2.imdecode(np.frombuffer(dmsg.data[12:], np.uint8), cv2.IMREAD_UNCHANGED).astype(np.float32)
+        except Exception:
+            depth = None
     h, _ = img.shape[:2]
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
     mask = ((hsv[:, :, 2] > 165)).astype(np.uint8) * 255
@@ -126,13 +161,19 @@ def detect_parcels(logfn):
         # 用 bounding box 中心，而非亮斑质心（质心会被反光/标签的不均匀亮度拉偏）
         u = x + bw / 2.0
         v = y + bh / 2.0
-        bx, by = _pixel_to_base(u, v, PARCEL_PLANE_Z_BASE)
-        bx += CAM_X_CORRECTION
+        p3 = _pixel_depth_to_base(u, v, depth)
+        if p3 is not None:
+            bx, by, bz = p3[0], p3[1], p3[2]
+        else:
+            bx, by = _pixel_to_base(u, v, PARCEL_PLANE_Z_BASE)
+            bx += CAM_X_CORRECTION
+            bz = None
         if bx < 0.0 or bx > 0.7:
             continue
-        found.append((bx, by))
+        found.append((bx, by, bz))
     found.sort()
-    logfn("scene1 detect: %d parcels %s", len(found), [(round(a, 3), round(b, 3)) for a, b in found])
+    logfn("scene1 detect: %d parcels %s", len(found),
+          [(round(a, 3), round(b, 3), (round(c, 3) if c is not None else None)) for a, b, c in found])
     return found
 
 
@@ -603,11 +644,15 @@ class Scene1Runner:
         self.log("wrist parcel base=(%.3f, %.3f) uv=(%.0f, %.0f) area=%d", bx, by, u, v, best_area)
         return [bx, by]
 
-    def run_parcel(self, arm_hold, name, ik_xy):
+    def run_parcel(self, arm_hold, name, ik_xy, z_top=None):
         offset = self._grasp_offset(ik_xy[1])
         px = ik_xy[0] + offset[0]
         py = ik_xy[1] + offset[1]
-        pz = RIGHT_PICK_IK_Z + offset[2]
+        if z_top is not None:
+            # 用深度实测顶面高度，避免平面假设带来的 z 偏差
+            pz = z_top - GRASP_BELOW_TOP + offset[2]
+        else:
+            pz = RIGHT_PICK_IK_Z + offset[2]
         # 预抓取（高位对齐）
         pre = [px, py, RIGHT_PICK_TRANSIT_IK_Z]
         self.right_arm_to(arm_hold, pre, self.right_pick_quat)
@@ -716,10 +761,12 @@ def run_scene(scene, seed, time_limit=None, timer_gui=True):
     runner.set_gripper(GRIP_OPEN, GRIP_OPEN)
 
     parcels = detect_parcels(rospy.loginfo)
-    for idx, ik_xy in enumerate(parcels):
+    for idx, item in enumerate(parcels):
+        ik_xy = (item[0], item[1])
+        z_top = item[2] if len(item) > 2 else None
         name = "parcel_det_%d" % idx
         try:
-            runner.run_parcel(arm_hold, name, ik_xy)
+            runner.run_parcel(arm_hold, name, ik_xy, z_top=z_top)
         except Exception as e:
             rospy.logerr("scene1 %s 失败: %s", name, e)
 
