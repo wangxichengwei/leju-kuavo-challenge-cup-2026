@@ -164,6 +164,9 @@ def detect_parcels(logfn):
         p3 = _pixel_depth_to_base(u, v, depth)
         if p3 is not None:
             bx, by, bz = p3[0], p3[1], p3[2]
+            # 过滤桌面/地面误检：包裹顶面应高于桌面（z > -0.005）
+            if bz < -0.03:
+                continue
         else:
             bx, by = _pixel_to_base(u, v, PARCEL_PLANE_Z_BASE)
             bx += CAM_X_CORRECTION
@@ -726,7 +729,7 @@ class Scene1Runner:
                 for _c in detect_parcels(self.log):
                     _cz = _c[2] if len(_c) > 2 else None
                     # 过滤桌面/地面误检（z 明显低于包裹顶面，包裹顶面约 0~0.06m）
-                    if _cz is not None and _cz < -0.005:
+                    if _cz is not None and _cz < -0.03:
                         continue
                     _d = math.sqrt((_c[0] - grasp[0]) ** 2 + (_c[1] - grasp[1]) ** 2)
                     if _d < _bd:
@@ -828,8 +831,13 @@ def run_scene(scene, seed, time_limit=None, timer_gui=True):
     runner.move_arm_deg(arm_hold, PRESET_FINAL_DEG, move_time=2.0, settle=1.0)
     runner.set_gripper(GRIP_OPEN, GRIP_OPEN)
 
-    parcels = detect_parcels(rospy.loginfo)
-    for idx, item in enumerate(parcels):
+    # 每抓一个前重新检测（抓走后剩余包裹坐标实时更新，避免抓第一个后其他包裹被碰动导致坐标过时）
+    for idx in range(4):
+        parcels = detect_parcels(rospy.loginfo)
+        if not parcels:
+            rospy.loginfo("scene1 第 %d 轮未检测到包裹，结束", idx)
+            break
+        item = parcels[0]  # 取 x 最小（最靠左）的包裹
         ik_xy = (item[0], item[1])
         z_top = item[2] if len(item) > 2 else None
         name = "parcel_det_%d" % idx
