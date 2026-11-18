@@ -40,6 +40,12 @@ RIGHT_PICK_OFFSET_NEAR_ROW = [-0.047, 0.0, 0.03]
 LIFT_Z_OFFSET = 0.30
 WEIGH_TRANSIT_IK_Z = 0.326217
 WEIGH_RELEASE_IK = [0.40, -0.574, 0.146217]
+# 换手 + 入箱（官方 handoff 常量）
+RIGHT_HANDOFF_TO_LEFT_IK = [0.246, -0.044645, 0.3016983]
+RIGHT_HANDOFF_TRANSIT_IK_Z = 0.40
+LEFT_HANDOFF_RECEIVE_IK = [0.266, 0.04645, 0.2216983]
+BOX_DROP_IK = [0.605966, 0.226114, 0.556217]
+PLACE_APPROACH_Z_OFFSET = 0.060
 WEIGH_REGRASP_IK = [0.40, -0.574, -0.04]
 IK_MODE_POS_HARD_ORI_HARD = 0x03
 IK_MODE_THREE_POINT_MIXED = 0x06
@@ -164,8 +170,8 @@ def detect_parcels(logfn):
         p3 = _pixel_depth_to_base(u, v, depth)
         if p3 is not None:
             bx, by, bz = p3[0], p3[1], p3[2]
-            # 过滤桌面/地面误检：包裹顶面应高于桌面（z > -0.005）
-            if bz < -0.03:
+            # 过滤桌面/手臂误检：包裹顶面 z 应在 -0.03 ~ 0.10（桌面以下或手臂高度均排除）
+            if bz < -0.03 or bz > 0.10:
                 continue
         else:
             bx, by = _pixel_to_base(u, v, PARCEL_PLANE_Z_BASE)
@@ -533,6 +539,60 @@ class Scene1Runner:
                 constraint_mode=IK_MODE_THREE_POINT_MIXED,
                 lock_left_preset=True)
 
+    def left_arm_to(self, arm_hold, ik_pos, quat,
+                    constraint_mode=IK_MODE_THREE_POINT_MIXED):
+        """左手到目标位姿（右手锁当前 FK，避免联合 IK 无解）。"""
+        cur = self.read_current_arm_rad()
+        fk = self.call_fk(cur)
+        right_pos = list(fk.right_pose.pos_xyz)
+        right_quat = list(fk.right_pose.quat_xyzw)
+        q = self.call_ik(
+            ik_pos, quat, right_pos, right_quat, cur,
+            constraint_mode=constraint_mode)
+        cur_deg = [math.degrees(v) for v in cur]
+        q_deg = [math.degrees(v) for v in q]
+        target = q_deg[:7] + cur_deg[7:14]  # 左手新解 + 右手保持当前
+        self.move_arm_deg(arm_hold, target, lock_left=False)
+        self.wait_converge(3.0)
+
+    def handoff_to_left_and_box(self, arm_hold, name):
+        """换手入箱：右手把包裹送到交接点 -> 左手接 -> 左手入箱。"""
+        import rospy
+        hq = quat_from_ypr([-0.839, -100.0, 0.0], [90.0, -20.0, 90.0])
+        rq = quat_from_ypr([-0.839, -100.0, 0.0], [-90.0, -0.0, -90.0])
+        bq = quat_from_ypr([-0.328, -100.935, 0.0], [-90.0, 0.0, 0.369])
+        # 1. 右手送到交接点（先中转高度再下降）
+        self.right_arm_to(arm_hold,
+                          [RIGHT_HANDOFF_TO_LEFT_IK[0], RIGHT_HANDOFF_TO_LEFT_IK[1], RIGHT_HANDOFF_TRANSIT_IK_Z], hq)
+        self.right_arm_to(arm_hold, RIGHT_HANDOFF_TO_LEFT_IK, hq)
+        self.log("scene1 %s handoff: 右手到交接点", name)
+        # 2. 左手到接应点
+        self.left_arm_to(arm_hold, LEFT_HANDOFF_RECEIVE_IK, rq)
+        self.log("scene1 %s handoff: 左手到接应点", name)
+        # 3. 换手：左手夹住 -> 右手松开
+        self.set_gripper(GRIP_CLOSE, GRIP_CLOSE)
+        rospy.sleep(0.6)
+        self.set_gripper(GRIP_CLOSE, GRIP_OPEN)
+        rospy.sleep(0.8)
+        self.log("scene1 %s handoff: 左手已接", name)
+        # 4. 右手退让抬升
+        self.right_arm_to(arm_hold,
+                          [RIGHT_HANDOFF_TO_LEFT_IK[0], RIGHT_HANDOFF_TO_LEFT_IK[1], RIGHT_HANDOFF_TRANSIT_IK_Z], hq)
+        # 5. 左手入箱（接近 -> 下放 -> 松开）
+        self.left_arm_to(arm_hold,
+                         [BOX_DROP_IK[0], BOX_DROP_IK[1], BOX_DROP_IK[2] + PLACE_APPROACH_Z_OFFSET], bq)
+        self.left_arm_to(arm_hold, BOX_DROP_IK, bq)
+        self.set_gripper(GRIP_OPEN, GRIP_OPEN)
+        rospy.sleep(1.0)
+        self.log("scene1 %s box drop done", name)
+        # 6. 双臂回预设位（让出头部相机视野，否则下一轮检测不到包裹）
+        try:
+            self.move_arm_deg(arm_hold, PRESET_FINAL_DEG, move_time=2.0, settle=1.0)
+            self.set_gripper(GRIP_OPEN, GRIP_OPEN)
+            self.log("scene1 %s 手臂已归位", name)
+        except Exception as _re:
+            self.log("scene1 %s 手臂归位失败(忽略): %s", name, str(_re)[:60])
+
     def move_right_cartesian_to(self, arm_hold, target_ik, quat, n_points=6,
                                 constraint_mode=IK_MODE_POS_HARD_ORI_HARD, seg_time=0.4):
         """笛卡尔直线分段运动（对齐官方 _move_right_cartesian_to）：末端沿直线分 n 段，逐点单手 IK，样条式连续下发。"""
@@ -773,14 +833,23 @@ class Scene1Runner:
         self.set_gripper(GRIP_OPEN, GRIP_OPEN)  # 开爪称重
         rospy.sleep(1.0)
         self.save_head_snapshot("/tmp/weigh_" + name + ".png")
-        # 二次抓取
+        # 二次抓取（称重后重新夹起）
         self.right_arm_to(arm_hold, WEIGH_REGRASP_IK, self.weigh_regrasp_quat)
         self.set_gripper(GRIP_OPEN, GRIP_CLOSE)
         rospy.sleep(1.0)
-        # 抬升（第一版到此为止，第二阶段再接换手入箱）
-        lift2 = [WEIGH_REGRASP_IK[0], WEIGH_REGRASP_IK[1], WEIGH_REGRASP_IK[2] + LIFT_Z_OFFSET]
-        self.right_arm_to(arm_hold, lift2, self.weigh_regrasp_quat)
-        self.set_gripper(GRIP_OPEN, GRIP_OPEN)
+        g2 = self.read_gripper_state()
+        self.log("scene1 %s regrasp GRASP=%s", name, str(round(g2, 4)) if g2 is not None else "None")
+        # 换手入箱
+        try:
+            self.handoff_to_left_and_box(arm_hold, name)
+        except Exception as e:
+            self.log("scene1 %s 换手入箱失败: %s", name, e)
+            try:
+                lift2 = [WEIGH_REGRASP_IK[0], WEIGH_REGRASP_IK[1], WEIGH_REGRASP_IK[2] + LIFT_Z_OFFSET]
+                self.right_arm_to(arm_hold, lift2, self.weigh_regrasp_quat)
+                self.set_gripper(GRIP_OPEN, GRIP_OPEN)
+            except Exception:
+                pass
         self.log("scene1 %s done" % name)
 
 
