@@ -253,8 +253,8 @@ def detect_scene2_parts(logfn):
         parts.append(("C", p[0], p[1], p[2]))
     for p, area in blobs(black.astype(np.uint8) * 255, 200, 4000):
         parts.append(("B", p[0], p[1], p[2]))
-    # A 银管件：长宽比 <6 排除细长的螺丝刀银杆（长宽比 ~205）
-    for p, area in blobs(silver.astype(np.uint8) * 255, 400, 4000, max_aspect=6.0):
+    # A 银管件：area>=250（含小管件）、长宽比 <2（银杆 aspect~3.1 排除）
+    for p, area in blobs(silver.astype(np.uint8) * 255, 250, 4000, max_aspect=2.0):
         parts.append(("A", p[0], p[1], p[2]))
     parts.sort(key=lambda t: (t[1], t[2]))
     logfn("scene2 detect: %d parts %s", len(parts), [(t, round(x, 3), round(y, 3)) for t, x, y, z in parts])
