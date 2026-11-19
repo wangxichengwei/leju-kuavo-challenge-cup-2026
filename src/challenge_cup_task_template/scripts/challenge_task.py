@@ -53,11 +53,14 @@ SCENE2_YAW_MANUAL_DEG = 90.0              # yaw_manual（官方 pi/2；左手自
 SCENE2_C_YAW_ADAPTIVE_DEG = -45.0         # C 螺丝刀额外 yaw_adaptive（官方 -pi/4）
 SCENE2_NARROW_EDGE_OFFSET_DEG = 90.0      # 窄边自动选 ±90°（官方 GRASP_NARROW_EDGE_YAW_OFFSET）
 SCENE2_PLACE_JOINTS = {
+    # 关节空间放置位（官方原值；已弃用，改为 IK 笛卡尔放置 SCENE2_BIN_XY，保留作参考/回退）
     ("right", "A"): [-30, -10, -10, -80, 70, 0, 0],
     ("right", "B"): [-30, 0, 30, -80, 70, 0, 0],
     ("left", "B"): [-30, 0, -30, -80, -70, 0, 0],
     ("left", "C"): [-30, 10, 10, -80, -70, 0, 0],
 }
+# 各箱中心（base 系 x,y，官方 PRESET_PLACE_TARGETS 含 PLACE_TARGET_X_BIAS=-0.03）
+SCENE2_BIN_XY = {"A": (0.535, -0.444), "B": (0.535, -0.014), "C": (0.535, 0.416)}
 SCENE2_BIN_TARGET_ARM = {"A": "right", "B": None, "C": "left"}  # B 按零件 y 分左右手
 WEIGH_REGRASP_IK = [0.40, -0.574, -0.04]
 IK_MODE_POS_HARD_ORI_HARD = 0x03
@@ -1229,20 +1232,26 @@ def run_scene2(seed, time_limit=None, timer_gui=True):
             else:
                 runner.left_arm_to(arm_hold, lift, quat_grasp)
             runner.save_head_snapshot("/tmp/lift_%s.png" % name)
-            # 放箱（关节空间固定姿态）
-            pj = SCENE2_PLACE_JOINTS.get((arm, t))
-            if pj is not None:
-                # 下发对应臂的放置关节（另一臂保持当前）
-                cur2 = runner.read_current_arm_rad(20)
-                cur2_deg = [_m.degrees(v) for v in cur2]
+            # 放箱（IK 笛卡尔：抬升后保持抓取姿态移到箱上方→下放→松开）
+            # 之前用关节空间摆动从抓取位甩到放置位，腕部会大角度扭转，松抓的螺丝刀易在甩动中滑脱
+            bin_xy = SCENE2_BIN_XY.get(t)
+            if bin_xy is not None:
+                bx, by = bin_xy
                 if arm == "right":
-                    full = cur2_deg[:7] + pj
+                    px, py = bx + 0.036, by + 0.014   # 右臂 IK 欠冲补偿
                 else:
-                    full = pj + cur2_deg[7:14]
-                runner.move_arm_deg(arm_hold, full, move_time=2.0, settle=1.0)
-                rospy.sleep(0.5)
+                    y_bias = -0.14 * (by - 0.22) if by > 0.22 else 0.0
+                    px, py = bx + 0.029, by + y_bias  # 左臂 IK 欠冲 + y 超调补偿
+                transit_z = 0.30   # 中转高度（高于箱，与抬升高度一致）
+                release_z = 0.20   # 下放释放高度（箱上方）
+                if arm == "right":
+                    runner.right_arm_to(arm_hold, [px, py, transit_z], quat_grasp)
+                    runner.right_grasp_to(arm_hold, [px, py, release_z], quat_grasp)
+                else:
+                    runner.left_arm_to(arm_hold, [px, py, transit_z], quat_grasp)
+                    runner.left_grasp_to(arm_hold, [px, py, release_z], quat_grasp)
                 runner.set_gripper(GRIP_OPEN, GRIP_OPEN)
-                rospy.sleep(1.5)  # 开爪后驻留，等零件落入箱内再归位（C 螺丝刀细长，需更长下落时间）
+                rospy.sleep(1.5)  # 开爪后驻留，等零件落入箱内再归位
                 rospy.loginfo("scene2 %s 已放箱 %s", name, t)
             # 归位
             runner.move_arm_deg(arm_hold, PRESET_FINAL_DEG, move_time=2.0, settle=1.0)
