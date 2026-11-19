@@ -458,6 +458,17 @@ def _scene2_should_flip_narrow_edge(part_type, object_yaw_rad, active_arm, objec
     return cosang < math.cos(math.radians(thr))
 
 
+def _scene2_grasp_yaw_total_rad(part_type, object_yaw_rad, active_arm, object_y=None):
+    """抓取姿态的 yaw_total（绕 base z，弧度），与官方 _pose_matrix_from_config 对齐。
+
+    夹爪前进方向（局部 -Z）在 base xy 平面夹角 ≈ yaw_total，故手指偏移要随它旋转。
+    """
+    narrow_deg = _scene2_select_narrow_edge(part_type, object_yaw_rad, active_arm)
+    if object_y is not None and _scene2_should_flip_narrow_edge(part_type, object_yaw_rad, active_arm, object_y):
+        narrow_deg = -narrow_deg
+    return object_yaw_rad + math.radians(_scene2_yaw_bias_deg(part_type) + narrow_deg)
+
+
 def scene2_grasp_quat(part_type, object_yaw_rad, active_arm, object_y=None):
     """构造 scene2 抓取四元数（xyzw），与官方 get_object_grasp_quat_xyzw 对齐。
 
@@ -465,12 +476,9 @@ def scene2_grasp_quat(part_type, object_yaw_rad, active_arm, object_y=None):
     active_arm: 'left' / 'right'（左手 yaw_manual 取反）。
     object_y: 工件 world/base y，用于窄边翻转启发；None 则跳过翻转。
     """
-    narrow_deg = _scene2_select_narrow_edge(part_type, object_yaw_rad, active_arm)
-    if object_y is not None and _scene2_should_flip_narrow_edge(part_type, object_yaw_rad, active_arm, object_y):
-        narrow_deg = -narrow_deg
+    yaw_total_rad = _scene2_grasp_yaw_total_rad(part_type, object_yaw_rad, active_arm, object_y)
     yaw_manual_deg = SCENE2_YAW_MANUAL_DEG if active_arm == "right" else -SCENE2_YAW_MANUAL_DEG
-    yaw_total_deg = math.degrees(object_yaw_rad) + _scene2_yaw_bias_deg(part_type) + narrow_deg
-    return quat_from_ypr([yaw_total_deg, SCENE2_GRASP_PITCH_DEG, 0.0],
+    return quat_from_ypr([math.degrees(yaw_total_rad), SCENE2_GRASP_PITCH_DEG, 0.0],
                          [yaw_manual_deg, 0.0, 0.0])
 
 
@@ -1213,24 +1221,31 @@ def run_scene2(seed, time_limit=None, timer_gui=True):
         # 抓取位姿：官方自适应 yaw（工件自身 yaw + yaw_adaptive + 窄边自动选）
         yaw_rad = yaw if yaw is not None else 0.0
         # C 用「红柄+银杆」组合 PCA yaw + 官方 yaw_adaptive=-45°；A/B 用固定位姿
-        if t == "C":
-            quat_grasp = scene2_grasp_quat(t, yaw_rad, arm, y)
-        else:
+        # A/C 用 yaw 自适应（斜放细件需随 yaw 旋转抓取点）；B 是 T 头近对称，PCA yaw 不可靠，保持固定位姿
+        if t == "B":
             yaw_manual_deg = SCENE2_YAW_MANUAL_DEG if arm == "right" else -SCENE2_YAW_MANUAL_DEG
             quat_grasp = quat_from_ypr([0.0, SCENE2_GRASP_PITCH_DEG, 0.0], [yaw_manual_deg, 0.0, 0.0])
+            _yaw_total = 0.0
+        else:
+            quat_grasp = scene2_grasp_quat(t, yaw_rad, arm, y)
+            _yaw_total = _scene2_grasp_yaw_total_rad(t, yaw_rad, arm, y)
         rospy.loginfo("scene2 %s yaw=%.1fdeg arm=%s", name, _m.degrees(yaw_rad), arm)
-        # 抓取点：深度定位中心 + 手指补偿（抓取姿态手指 +x 47mm）+ IK 欠冲补偿
+        # 抓取点：深度定位中心 + 手指补偿 + IK 欠冲补偿
+        # 手指偏移 47mm 随夹爪前进方向(yaw_total)旋转到 base 系（对齐官方 local-frame offset），
+        # 否则斜放的 C/A/B 细件抓取点会偏到错误方向。
         # diag FK 实测：右臂 x 欠冲 3.6cm、y 偏 -1.4cm；左臂 x 欠冲 2.9cm、y ~0
         # 远点（|y|>0.33）在工作空间边缘，IK 执行误差大，抓取点向中线内收 3cm 抓近边
         y_g = y
         if abs(y) > 0.33:
             y_g = y - 0.03 * (1 if y > 0 else -1)
+        _offx = -0.047 * _m.cos(_yaw_total)
+        _offy = -0.047 * _m.sin(_yaw_total)
         if arm == "right":
-            gx, gy, gz = x - 0.047 + 0.036, y_g + 0.014, z + 0.01
+            gx, gy, gz = x + _offx + 0.036, y_g + _offy + 0.014, z + 0.01
         else:
             # 左臂 x/y 超调都随 y 增大（FK 实测 y=0.39 时手指 x 前伸 +3.8cm、y +3.7cm），线性补偿
             b = -0.20 * (y_g - 0.22) if y_g > 0.22 else 0.0
-            gx, gy, gz = x - 0.047 + 0.029 + b, y_g + b, z + 0.01
+            gx, gy, gz = x + _offx + 0.029 + b, y_g + _offy + b, z + 0.01
         try:
             # 中转到位
             if arm == "right":
@@ -1238,7 +1253,7 @@ def run_scene2(seed, time_limit=None, timer_gui=True):
             else:
                 runner.left_arm_to(arm_hold, [gx, gy, RIGHT_PICK_TRANSIT_IK_Z], quat_grasp)
             # 下探 + FK 闭环校正：工作空间边缘 IK 执行误差大且不稳，读 FK 迭代校正到期望 EE
-            _des = [x - 0.047, y_g, z + 0.01]   # 期望 EE：手指前伸 47mm 后恰在工件近边
+            _des = [x + _offx, y_g + _offy, z + 0.01]   # 期望 EE：手指前伸 47mm 后恰在工件近边
             _cx, _cy, _cz = gx, gy, gz
             for _fc in range(3):
                 if arm == "right":
