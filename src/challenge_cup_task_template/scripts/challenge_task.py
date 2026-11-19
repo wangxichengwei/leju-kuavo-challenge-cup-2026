@@ -872,6 +872,13 @@ class Scene1Runner:
         self.left_arm_to(arm_hold,
                          [BOX_DROP_IK[0], BOX_DROP_IK[1], BOX_DROP_IK[2] + PLACE_APPROACH_Z_OFFSET], bq)
         self.left_arm_to(arm_hold, BOX_DROP_IK, bq)
+        try:
+            _fk = self.call_fk(self.read_current_arm_rad(20), 8.0)
+            _lp = list(_fk.left_pose.pos_xyz)
+            self.log("scene1 %s box drop 左手FK=(%.3f,%.3f,%.3f) 目标=(%.3f,%.3f,%.3f)",
+                     name, _lp[0], _lp[1], _lp[2], BOX_DROP_IK[0], BOX_DROP_IK[1], BOX_DROP_IK[2])
+        except Exception:
+            pass
         self.set_gripper(GRIP_OPEN, GRIP_OPEN)
         rospy.sleep(1.0)
         self.log("scene1 %s box drop done", name)
@@ -1009,6 +1016,9 @@ class Scene1Runner:
         offset = self._grasp_offset(ik_xy[1])
         px = ik_xy[0] + offset[0]
         py = ik_xy[1] + offset[1]
+        # 远件（x>0.45）在右臂工作空间边缘，手指需够到 x 处易超出可达域，抓取点内收 3cm 抓近边
+        if ik_xy[0] > 0.45:
+            px -= 0.03
         if z_top is not None:
             # 用深度实测顶面高度，避免平面假设带来的 z 偏差
             pz = z_top - GRASP_BELOW_TOP + offset[2]
@@ -1092,7 +1102,11 @@ class Scene1Runner:
             except Exception as _de:
                 self.log("scene1 %s re-detect fail: %s" % (name, _de))
             if _best is not None and _bd < 0.10 and _best[2] is not None:
-                _retry = [_best[0], _best[1], _best[2] - GRASP_BELOW_TOP + 0.012]
+                _off = self._grasp_offset(_best[1])
+                _rx = _best[0] + _off[0]
+                if _best[0] > 0.45:
+                    _rx -= 0.03   # 远件内收，与初始抓取一致
+                _retry = [_rx, _best[1] + _off[1], _best[2] - GRASP_BELOW_TOP + 0.012 + _off[2]]
                 self.log("scene1 %s retry#%d box moved %.0fmm -> re-grasp (%.3f,%.3f)"
                          % (name, _try + 1, _bd * 1000.0, _retry[0], _retry[1]))
             else:
@@ -1378,6 +1392,12 @@ def run_scene(scene, seed, time_limit=None, timer_gui=True):
         except Exception as e:
             rospy.logerr("scene1 %s 失败: %s", name, e)
 
+    rospy.sleep(0.5)
+    try:
+        runner.save_head_snapshot("/tmp/scene1_final.png")
+        rospy.loginfo("scene1 final snapshot saved")
+    except Exception as _fe:
+        rospy.logwarn("scene1 final snapshot fail: %s", _fe)
     rospy.loginfo("scene1 试点结束")
     rospy.sleep(2.0)
     if time_limit:
