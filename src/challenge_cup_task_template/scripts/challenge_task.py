@@ -47,7 +47,11 @@ LEFT_HANDOFF_RECEIVE_IK = [0.266, 0.04645, 0.2216983]
 BOX_DROP_IK = [0.605966, 0.226114, 0.556217]
 PLACE_APPROACH_Z_OFFSET = 0.060
 # ===== scene2 零件分拣 =====
-SCENE2_GRASP_A_B_QUAT = None  # 占位，实际用 quat_from_ypr([0,-45,0],[90,0,0])
+# 抓取位姿与官方 scene2_part_grasp_ik.py 对齐：yaw_adaptive 叠加在工件自身 yaw 上。
+SCENE2_GRASP_PITCH_DEG = -45.0            # pitch_adaptive（官方 -pi/4）
+SCENE2_YAW_MANUAL_DEG = 90.0              # yaw_manual（官方 pi/2；左手自动取反）
+SCENE2_C_YAW_ADAPTIVE_DEG = -45.0         # C 螺丝刀额外 yaw_adaptive（官方 -pi/4）
+SCENE2_NARROW_EDGE_OFFSET_DEG = 90.0      # 窄边自动选 ±90°（官方 GRASP_NARROW_EDGE_YAW_OFFSET）
 SCENE2_PLACE_JOINTS = {
     ("right", "A"): [-30, -10, -10, -80, 70, 0, 0],
     ("right", "B"): [-30, 0, 30, -80, 70, 0, 0],
@@ -101,17 +105,28 @@ def _rot_vec(v, qq):
     return [v[0]+2*qw*x[0]+2*y[0], v[1]+2*qw*x[1]+2*y[1], v[2]+2*qw*x[2]+2*y[2]]
 
 
-def _pixel_to_base(u, v, zplane):
+def _pixel_to_base(u, v, zplane, cam_pos=None, cam_quat=None):
+    if cam_pos is None:
+        cam_pos = CAM_POS
+    if cam_quat is None:
+        cam_quat = CAM_QUAT
     dcam = [(u-CAM_CX)/CAM_FX, (v-CAM_CY)/CAM_FY, 1.0]
-    dbase = _rot_vec(dcam, CAM_QUAT)
-    t = (zplane - CAM_POS[2]) / dbase[2]
-    return [CAM_POS[0]+t*dbase[0], CAM_POS[1]+t*dbase[1]]
+    dbase = _rot_vec(dcam, cam_quat)
+    t = (zplane - cam_pos[2]) / dbase[2]
+    return [cam_pos[0]+t*dbase[0], cam_pos[1]+t*dbase[1]]
 
 
-def _pixel_depth_to_base(u, v, depth):
-    """像素 + 深度图 -> base 3D 坐标（米）。depth 为 uint16 毫米数组。"""
+def _pixel_depth_to_base(u, v, depth, cam_pos=None, cam_quat=None):
+    """像素 + 深度图 -> base 3D 坐标（米）。depth 为 uint16 毫米数组。
+
+    cam_pos/cam_quat 可选：头部相机当前位姿（TF 查询）；None 则用标定常量 CAM_POS/CAM_QUAT。
+    """
     if depth is None:
         return None
+    if cam_pos is None:
+        cam_pos = CAM_POS
+    if cam_quat is None:
+        cam_quat = CAM_QUAT
     h, w = depth.shape[:2]
     iu, iv = int(round(u)), int(round(v))
     if iu < 1 or iv < 1 or iu >= w - 1 or iv >= h - 1:
@@ -129,8 +144,29 @@ def _pixel_depth_to_base(u, v, depth):
     dm = dmm / 1000.0
     xc = (u - CAM_CX) / CAM_FX * dm
     yc = (v - CAM_CY) / CAM_FY * dm
-    p = _rot_vec([xc, yc, dm], CAM_QUAT)
-    return [CAM_POS[0] + p[0], CAM_POS[1] + p[1], CAM_POS[2] + p[2]]
+    p = _rot_vec([xc, yc, dm], cam_quat)
+    return [cam_pos[0] + p[0], cam_pos[1] + p[1], cam_pos[2] + p[2]]
+
+
+def _get_head_cam_pose(timeout=3.0):
+    """查询 TF 获取头部相机当前位姿（base_link -> Head Camera View）。
+
+    低头后相机位姿会变，固定 CAM_POS/CAM_QUAT 会失准；返回 (pos, quat_xyzw)，失败返回 (None, None)。
+    """
+    import rospy
+    try:
+        import tf
+        listener = tf.TransformListener()
+        for frame in ("Head Camera View", "head_camera", "head_camera_view", "head_camera_optical_frame"):
+            try:
+                listener.waitForTransform("base_link", frame, rospy.Time(0), rospy.Duration(timeout))
+                trans, rot = listener.lookupTransform("base_link", frame, rospy.Time(0))
+                return list(trans), list(rot)
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return None, None
 
 
 def detect_parcels(logfn):
@@ -212,16 +248,40 @@ def detect_scene2_parts(logfn):
         return [], {}
     color = cv2.imdecode(np.frombuffer(cm.data, np.uint8), cv2.IMREAD_COLOR)
     depth = cv2.imdecode(np.frombuffer(dm.data[12:], np.uint8), cv2.IMREAD_UNCHANGED).astype(np.float32)
+    cam_pos, cam_quat = _get_head_cam_pose()
+    if cam_pos is None:
+        cam_pos, cam_quat = CAM_POS, CAM_QUAT
     h, w = color.shape[:2]
     hsv = cv2.cvtColor(color, cv2.COLOR_BGR2HSV)
     H = hsv[:,:,0]; S = hsv[:,:,1]; V = hsv[:,:,2]
 
     def to3d(u, v):
-        p = _pixel_depth_to_base(u, v, depth)
+        p = _pixel_depth_to_base(u, v, depth, cam_pos, cam_quat)
         # 零件在桌面附近（z -0.25~0.15），排除胸前手臂（z>0.3）和地面
         if p is not None and -0.25 <= p[2] <= 0.15:
             return p
         return None
+
+    def _blob_yaw(labels, label_id, zplane):
+        """2D 图像 PCA 取主轴，沿主轴两端点反投影到 zplane 平面，算世界 yaw（弧度）。
+
+        图像像素取主轴（不受深度噪声影响）；两端点用平面求交反投影，两点连线方向即工件长轴 yaw。
+        """
+        ys, xs = np.where(labels == label_id)
+        if len(xs) < 8:
+            return None
+        pts = np.stack([xs.astype(np.float32), ys.astype(np.float32)], axis=1)
+        mean, eigvec = cv2.PCACompute(pts, mean=None)
+        v = eigvec[0]
+        mu, mv = float(mean[0, 0]), float(mean[0, 1])
+        L = 40.0
+        p1 = _pixel_to_base(mu + v[0] * L, mv + v[1] * L, zplane, cam_pos, cam_quat)
+        p2 = _pixel_to_base(mu - v[0] * L, mv - v[1] * L, zplane, cam_pos, cam_quat)
+        dx, dy = p1[0] - p2[0], p1[1] - p2[1]
+        n = math.hypot(dx, dy)
+        if n < 1e-6:
+            return None
+        return math.atan2(dy, dx)
 
     def blobs(mask, area_lo, area_hi, min_aspect=None, max_aspect=None):
         k = np.ones((5, 5), np.uint8)
@@ -241,7 +301,7 @@ def detect_scene2_parts(logfn):
             u, v = cents[i]
             p = to3d(u, v)
             if p is not None:
-                out.append((p, int(area)))
+                out.append((p, int(area), _blob_yaw(labels, i, p[2])))
         return out
 
     red = ((H < 10) | (H > 170)) & (S > 80) & (V > 60)
@@ -249,15 +309,60 @@ def detect_scene2_parts(logfn):
     silver = (S < 60) & (V > 120)
 
     parts = []
-    for p, area in blobs(red.astype(np.uint8) * 255, 200, 4000):
-        parts.append(("C", p[0], p[1], p[2]))
-    for p, area in blobs(black.astype(np.uint8) * 255, 200, 4000):
-        parts.append(("B", p[0], p[1], p[2]))
-    # A 银管件：area>=250（含小管件）、长宽比 <2（银杆 aspect~3.1 排除）
-    for p, area in blobs(silver.astype(np.uint8) * 255, 250, 4000, max_aspect=2.0):
-        parts.append(("A", p[0], p[1], p[2]))
+    # 组合 mask（红柄 + 银杆 = 完整螺丝刀），用于 C 朝向的 2D PCA
+    _combined = red | silver
+    _ck = np.ones((3, 3), np.uint8)
+    _cm = cv2.morphologyEx(_combined.astype(np.uint8) * 255, cv2.MORPH_CLOSE, _ck)
+    _cn, _clabels, _cstats, _ccents = cv2.connectedComponentsWithStats(_cm, 8)
+
+    def _combined_screwdriver_yaw(u, v, zplane):
+        """对「红柄+银杆」合成连通域做 2D PCA 取主轴，反投影到 zplane 平面算 yaw。"""
+        iu, iv = int(round(u)), int(round(v))
+        if not (0 <= iv < _clabels.shape[0] and 0 <= iu < _clabels.shape[1]):
+            return None
+        _cl = _clabels[iv, iu]
+        if _cl == 0:
+            return None
+        ys, xs = np.where(_clabels == _cl)
+        if len(xs) < 8:
+            return None
+        pts = np.stack([xs.astype(np.float32), ys.astype(np.float32)], axis=1)
+        mean, eigvec = cv2.PCACompute(pts, mean=None)
+        v = eigvec[0]
+        mu, mv = float(mean[0, 0]), float(mean[0, 1])
+        L = 60.0
+        p1 = _pixel_to_base(mu + v[0] * L, mv + v[1] * L, zplane, cam_pos, cam_quat)
+        p2 = _pixel_to_base(mu - v[0] * L, mv - v[1] * L, zplane, cam_pos, cam_quat)
+        dx, dy = p1[0] - p2[0], p1[1] - p2[1]
+        n = math.hypot(dx, dy)
+        if n < 1e-6:
+            return None
+        # 反投影带常数 ~45° 旋转误差（C_0/C_5 实测偏移一致 45.4°），减去校准
+        return math.atan2(dy, dx) - math.radians(45.0)
+
+    # C 螺丝刀：单独检测红柄，朝向用组合连通域 PCA
+    _rk = np.ones((5, 5), np.uint8)
+    _rm = cv2.morphologyEx(red.astype(np.uint8) * 255, cv2.MORPH_OPEN, _rk)
+    _rm = cv2.morphologyEx(_rm, cv2.MORPH_CLOSE, _rk)
+    _rn, _rlabels, _rstats, _rcents = cv2.connectedComponentsWithStats(_rm, 8)
+    for _i in range(1, _rn):
+        if _rstats[_i][4] < 200 or _rstats[_i][4] > 4000:
+            continue
+        _u, _v = _rcents[_i]
+        _p = to3d(_u, _v)
+        if _p is None:
+            continue
+        _cy = _combined_screwdriver_yaw(_u, _v, _p[2])
+        parts.append(("C", _p[0], _p[1], _p[2], _cy))
+    for p, area, yaw in blobs(black.astype(np.uint8) * 255, 200, 4000):
+        parts.append(("B", p[0], p[1], p[2], yaw))
+    # A 银管件：area>=100（含小管件）、长宽比 <2.0（螺丝刀银颈 aspect 2.4~2.8 排除）。
+    # 头部下看后 A 管件 blob 面积约 144~199；手臂灰色圆柱面积 6000+ 由 z 过滤排除。
+    for p, area, yaw in blobs(silver.astype(np.uint8) * 255, 100, 10000, max_aspect=2.0):
+        parts.append(("A", p[0], p[1], p[2], yaw))
     parts.sort(key=lambda t: (t[1], t[2]))
-    logfn("scene2 detect: %d parts %s", len(parts), [(t, round(x, 3), round(y, 3)) for t, x, y, z in parts])
+    logfn("scene2 detect: %d parts %s", len(parts),
+          [(t, round(x, 3), round(y, 3), (round(math.degrees(yw), 1) if yw is not None else None)) for t, x, y, z, yw in parts])
     return parts, {}
 
 
@@ -298,6 +403,89 @@ def quat_from_ypr(first, second=None):
             c, s = math.cos(mr), math.sin(mr); mm = _matmul3([[1, 0, 0], [0, c, -s], [0, s, c]], mm)
         m = _matmul3(m, mm)
     return _rot_mat_to_quat_xyzw(m)
+
+def _scene2_yaw_bias_deg(part_type):
+    """官方 yaw_adaptive 偏置：仅 C 螺丝刀额外 -45°。"""
+    return SCENE2_C_YAW_ADAPTIVE_DEG if part_type == "C" else 0.0
+
+
+def _scene2_tool_forward_x(part_type, object_yaw_rad, active_arm, narrow_deg):
+    """官方 _tool_forward_x_score：夹爪前进方向（局部 -Z）在世界系 x 分量。
+
+    grasp 姿态 pitch_manual=roll_manual=0，故 forward_x ∝ cos(yaw_adaptive)，等价于 cos(yaw_total)。
+    """
+    yaw_total_rad = object_yaw_rad + math.radians(_scene2_yaw_bias_deg(part_type) + narrow_deg)
+    return math.cos(yaw_total_rad)
+
+
+def _scene2_select_narrow_edge(part_type, object_yaw_rad, active_arm):
+    """官方 _select_narrow_edge_yaw_offset：在 ±90° 里选让夹爪朝机器人前方(+x)的那一侧。"""
+    return max((SCENE2_NARROW_EDGE_OFFSET_DEG, -SCENE2_NARROW_EDGE_OFFSET_DEG),
+               key=lambda off: _scene2_tool_forward_x(part_type, object_yaw_rad, active_arm, off))
+
+
+def _scene2_should_flip_narrow_edge(part_type, object_yaw_rad, active_arm, object_y):
+    """官方 _part_should_grasp_other_narrow_edge_by_axis（yaw-only 近似）。
+
+    A/B 按工件局部 Y 轴在世界 xy 的方向判断是否翻到窄边另一头；C 仅右手在 y∈[-0.3,0] 有特殊规则。
+    """
+    if part_type == "C":
+        if active_arm == "right" and -0.3 <= object_y <= 0.0:
+            c, s = math.cos(object_yaw_rad), math.sin(object_yaw_rad)
+            vx, vy, vz = -c, -s, 1.0  # 局部 [-1,0,1] 轴经 yaw 旋转
+            n = math.sqrt(vx * vx + vy * vy + vz * vz)
+            if n <= 1e-9:
+                return False
+            return (-vy / n) >= math.cos(math.radians(20.0))
+        return False
+    if part_type == "A" and -0.2 <= object_y <= 0.1:
+        tx, ty, thr = 1.0, 1.0, 45.0
+    elif part_type == "B" and 0.0 <= object_y <= 0.2:
+        tx, ty, thr = 1.0, -1.0, 45.0
+    elif part_type == "B" and -0.2 <= object_y < 0.0:
+        tx, ty, thr = 1.0, 1.0, 45.0
+    else:
+        return False
+    ax, ay = -math.sin(object_yaw_rad), math.cos(object_yaw_rad)
+    n = math.hypot(ax, ay)
+    tn = math.hypot(tx, ty)
+    if n <= 1e-9:
+        return True
+    cosang = abs((ax * tx + ay * ty) / (n * tn))
+    return cosang < math.cos(math.radians(thr))
+
+
+def scene2_grasp_quat(part_type, object_yaw_rad, active_arm, object_y=None):
+    """构造 scene2 抓取四元数（xyzw），与官方 get_object_grasp_quat_xyzw 对齐。
+
+    object_yaw_rad: 相机检测到的工件自身 yaw（绕 base z，弧度）。
+    active_arm: 'left' / 'right'（左手 yaw_manual 取反）。
+    object_y: 工件 world/base y，用于窄边翻转启发；None 则跳过翻转。
+    """
+    narrow_deg = _scene2_select_narrow_edge(part_type, object_yaw_rad, active_arm)
+    if object_y is not None and _scene2_should_flip_narrow_edge(part_type, object_yaw_rad, active_arm, object_y):
+        narrow_deg = -narrow_deg
+    yaw_manual_deg = SCENE2_YAW_MANUAL_DEG if active_arm == "right" else -SCENE2_YAW_MANUAL_DEG
+    yaw_total_deg = math.degrees(object_yaw_rad) + _scene2_yaw_bias_deg(part_type) + narrow_deg
+    return quat_from_ypr([yaw_total_deg, SCENE2_GRASP_PITCH_DEG, 0.0],
+                         [yaw_manual_deg, 0.0, 0.0])
+
+
+def publish_head_down():
+    """官方 _publish_head_target：头部下看 20°，让近端零件进入头部相机视野。
+
+    scene2 检测前必须调用，否则近端零件被画面下边缘裁切，检测会漏件。
+    """
+    import rospy
+    from kuavo_msgs.msg import robotHeadMotionData
+    pub = rospy.Publisher("/robot_head_motion_data", robotHeadMotionData, queue_size=10)
+    rospy.sleep(0.5)
+    msg = robotHeadMotionData()
+    msg.joint_data = [0.0, 20.0]
+    for _ in range(5):
+        pub.publish(msg)
+        rospy.sleep(0.1)
+    rospy.sleep(0.4)
 
 
 class ArmHold:
@@ -445,13 +633,14 @@ class Scene1Runner:
             raise RuntimeError("arm mode %s rejected: %s" % (mode, resp.message))
         self.log("scene1: arm mode -> %s OK (%s)", mode, resp.message)
 
-    def read_gripper_state(self):
+    def read_gripper_state(self, side="right"):
         import rospy
         from sensor_msgs.msg import JointState
+        name = side + "_gripper_joint"
         try:
             msg = rospy.wait_for_message("/gripper/state", JointState, timeout=3.0)
             for i, n in enumerate(msg.name):
-                if n == "right_gripper_joint" and i < len(msg.position):
+                if n == name and i < len(msg.position):
                     return float(msg.position[i])
         except Exception:
             pass
@@ -629,6 +818,18 @@ class Scene1Runner:
         target = q_deg[:7] + cur_deg[7:14]  # 左手新解 + 右手保持当前
         self.move_arm_deg(arm_hold, target, lock_left=False)
         self.wait_converge(3.0)
+
+    def left_grasp_to(self, arm_hold, ik_pos, quat):
+        """左手最终下探优先位姿硬约束；无解时回退混合约束（对称 right_grasp_to）。"""
+        try:
+            self.left_arm_to(
+                arm_hold, ik_pos, quat,
+                constraint_mode=IK_MODE_POS_HARD_ORI_HARD)
+        except RuntimeError as exc:
+            self.log("scene2 left hard grasp IK failed, fallback to mixed IK: %s" % exc)
+            self.left_arm_to(
+                arm_hold, ik_pos, quat,
+                constraint_mode=IK_MODE_THREE_POINT_MIXED)
 
     def handoff_to_left_and_box(self, arm_hold, name):
         """换手入箱：右手把包裹送到交接点 -> 左手接 -> 左手入箱。"""
@@ -979,21 +1180,36 @@ def run_scene2(seed, time_limit=None, timer_gui=True):
     rospy.sleep(0.5)
     runner.move_arm_deg(arm_hold, PRESET_FINAL_DEG, move_time=2.0, settle=1.2)
     runner.set_gripper(GRIP_OPEN, GRIP_OPEN)
+    publish_head_down()  # 头部下看，避免近端零件被画面下边缘裁切（官方 HEAD_TARGET=[0,20]）
 
     parts, _bins = detect_scene2_parts(rospy.loginfo)
     if not parts:
         rospy.logwarn("scene2 未检测到零件")
         return
-    quat_grasp = quat_from_ypr([0, -45, 0], [90, 0, 0])  # pitch=-45 抓取姿态
     for idx, part in enumerate(parts):
-        t, x, y, z = part
+        t, x, y, z, yaw = part
         arm = SCENE2_BIN_TARGET_ARM.get(t, "right")
         if arm is None:
             # B 按零件 y 分左右手（y<0 右手，y>0 左手）
             arm = "right" if y < 0 else "left"
         name = "part_%s_%d" % (t, idx)
-        # 抓取点：深度定位中心 + 手指补偿（抓取姿态手指 +x 47mm）
-        gx, gy, gz = x - 0.047, y, z + 0.01
+        # 抓取位姿：官方自适应 yaw（工件自身 yaw + yaw_adaptive + 窄边自动选）
+        yaw_rad = yaw if yaw is not None else 0.0
+        # C 用「红柄+银杆」组合 PCA yaw + 官方 yaw_adaptive=-45°；A/B 用固定位姿
+        if t == "C":
+            quat_grasp = scene2_grasp_quat(t, yaw_rad, arm, y)
+        else:
+            yaw_manual_deg = SCENE2_YAW_MANUAL_DEG if arm == "right" else -SCENE2_YAW_MANUAL_DEG
+            quat_grasp = quat_from_ypr([0.0, SCENE2_GRASP_PITCH_DEG, 0.0], [yaw_manual_deg, 0.0, 0.0])
+        rospy.loginfo("scene2 %s yaw=%.1fdeg arm=%s", name, _m.degrees(yaw_rad), arm)
+        # 抓取点：深度定位中心 + 手指补偿（抓取姿态手指 +x 47mm）+ IK 欠冲补偿
+        # diag FK 实测：右臂 x 欠冲 3.6cm、y 偏 -1.4cm；左臂 x 欠冲 2.9cm、y ~0
+        if arm == "right":
+            gx, gy, gz = x - 0.047 + 0.036, y + 0.014, z + 0.01
+        else:
+            # 左臂 y 正超调随 y 增大（y=0.22 约 0，y=0.39 约 +2.4cm），线性补偿
+            y_bias = -0.14 * (y - 0.22) if y > 0.22 else 0.0
+            gx, gy, gz = x - 0.047 + 0.029, y + y_bias, z + 0.01
         try:
             if arm == "right":
                 runner.right_arm_to(arm_hold, [gx, gy, RIGHT_PICK_TRANSIT_IK_Z], quat_grasp)
@@ -1001,10 +1217,10 @@ def run_scene2(seed, time_limit=None, timer_gui=True):
                 runner.set_gripper(GRIP_OPEN, GRIP_CLOSE)
             else:
                 runner.left_arm_to(arm_hold, [gx, gy, RIGHT_PICK_TRANSIT_IK_Z], quat_grasp)
-                runner.left_arm_to(arm_hold, [gx, gy, gz], quat_grasp)
+                runner.left_grasp_to(arm_hold, [gx, gy, gz], quat_grasp)
                 runner.set_gripper(GRIP_CLOSE, GRIP_OPEN)
             rospy.sleep(1.0)
-            g = runner.read_gripper_state()
+            g = runner.read_gripper_state(arm)
             rospy.loginfo("scene2 %s GRASP=%s", name, str(round(g, 4)) if g is not None else "None")
             # 抬升
             lift = [gx, gy, gz + LIFT_Z_OFFSET]
@@ -1012,6 +1228,7 @@ def run_scene2(seed, time_limit=None, timer_gui=True):
                 runner.right_arm_to(arm_hold, lift, quat_grasp)
             else:
                 runner.left_arm_to(arm_hold, lift, quat_grasp)
+            runner.save_head_snapshot("/tmp/lift_%s.png" % name)
             # 放箱（关节空间固定姿态）
             pj = SCENE2_PLACE_JOINTS.get((arm, t))
             if pj is not None:
@@ -1036,6 +1253,7 @@ def run_scene2(seed, time_limit=None, timer_gui=True):
             except Exception:
                 pass
     rospy.loginfo("scene2 试点结束")
+    runner.save_head_snapshot("/tmp/scene2_final.png")
     rospy.sleep(2.0)
     if time_limit:
         rospy.signal_shutdown("done")
