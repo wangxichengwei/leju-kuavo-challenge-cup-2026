@@ -1242,6 +1242,7 @@ def run_scene2(seed, time_limit=None, timer_gui=True):
                 runner.move_arm_deg(arm_hold, full, move_time=2.0, settle=1.0)
                 rospy.sleep(0.5)
                 runner.set_gripper(GRIP_OPEN, GRIP_OPEN)
+                rospy.sleep(1.5)  # 开爪后驻留，等零件落入箱内再归位（C 螺丝刀细长，需更长下落时间）
                 rospy.loginfo("scene2 %s 已放箱 %s", name, t)
             # 归位
             runner.move_arm_deg(arm_hold, PRESET_FINAL_DEG, move_time=2.0, settle=1.0)
