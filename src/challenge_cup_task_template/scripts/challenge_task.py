@@ -1207,24 +1207,77 @@ def run_scene2(seed, time_limit=None, timer_gui=True):
         rospy.loginfo("scene2 %s yaw=%.1fdeg arm=%s", name, _m.degrees(yaw_rad), arm)
         # 抓取点：深度定位中心 + 手指补偿（抓取姿态手指 +x 47mm）+ IK 欠冲补偿
         # diag FK 实测：右臂 x 欠冲 3.6cm、y 偏 -1.4cm；左臂 x 欠冲 2.9cm、y ~0
+        # 远点（|y|>0.33）在工作空间边缘，IK 执行误差大，抓取点向中线内收 3cm 抓近边
+        y_g = y
+        if abs(y) > 0.33:
+            y_g = y - 0.03 * (1 if y > 0 else -1)
         if arm == "right":
-            gx, gy, gz = x - 0.047 + 0.036, y + 0.014, z + 0.01
+            gx, gy, gz = x - 0.047 + 0.036, y_g + 0.014, z + 0.01
         else:
-            # 左臂 y 正超调随 y 增大（y=0.22 约 0，y=0.39 约 +2.4cm），线性补偿
-            y_bias = -0.14 * (y - 0.22) if y > 0.22 else 0.0
-            gx, gy, gz = x - 0.047 + 0.029, y + y_bias, z + 0.01
+            # 左臂 x/y 超调都随 y 增大（FK 实测 y=0.39 时手指 x 前伸 +3.8cm、y +3.7cm），线性补偿
+            b = -0.20 * (y_g - 0.22) if y_g > 0.22 else 0.0
+            gx, gy, gz = x - 0.047 + 0.029 + b, y_g + b, z + 0.01
         try:
+            # 中转到位
             if arm == "right":
                 runner.right_arm_to(arm_hold, [gx, gy, RIGHT_PICK_TRANSIT_IK_Z], quat_grasp)
-                runner.right_grasp_to(arm_hold, [gx, gy, gz], quat_grasp)
-                runner.set_gripper(GRIP_OPEN, GRIP_CLOSE)
             else:
                 runner.left_arm_to(arm_hold, [gx, gy, RIGHT_PICK_TRANSIT_IK_Z], quat_grasp)
-                runner.left_grasp_to(arm_hold, [gx, gy, gz], quat_grasp)
+            # 下探 + FK 闭环校正：工作空间边缘 IK 执行误差大且不稳，读 FK 迭代校正到期望 EE
+            _des = [x - 0.047, y_g, z + 0.01]   # 期望 EE：手指前伸 47mm 后恰在工件近边
+            _cx, _cy, _cz = gx, gy, gz
+            for _fc in range(3):
+                if arm == "right":
+                    runner.right_grasp_to(arm_hold, [_cx, _cy, _cz], quat_grasp)
+                else:
+                    runner.left_grasp_to(arm_hold, [_cx, _cy, _cz], quat_grasp)
+                _fk = runner.call_fk(runner.read_current_arm_rad(10), 5.0)
+                _e = list(_fk.left_pose.pos_xyz) if arm == "left" else list(_fk.right_pose.pos_xyz)
+                _ex, _ey, _ez = _des[0] - _e[0], _des[1] - _e[1], _des[2] - _e[2]
+                rospy.loginfo("scene2 %s FK校正%d fk=(%.3f,%.3f,%.3f) err=(%.3f,%.3f,%.3f)", name, _fc, _e[0], _e[1], _e[2], _ex, _ey, _ez)
+                if max(abs(_ex), abs(_ey), abs(_ez)) < 0.012:
+                    break
+                _cx, _cy, _cz = _cx + _ex, _cy + _ey, _cz + _ez
+            gx, gy, gz = _cx, _cy, _cz   # 抬升/后续用校正后的实际抓取点
+            # 闭合
+            if arm == "right":
+                runner.set_gripper(GRIP_OPEN, GRIP_CLOSE)
+            else:
                 runner.set_gripper(GRIP_CLOSE, GRIP_OPEN)
             rospy.sleep(1.0)
             g = runner.read_gripper_state(arm)
             rospy.loginfo("scene2 %s GRASP=%s", name, str(round(g, 4)) if g is not None else "None")
+            try:
+                _fk = runner.call_fk(runner.read_current_arm_rad(10), 5.0)
+                _e = list(_fk.left_pose.pos_xyz) if arm == "left" else list(_fk.right_pose.pos_xyz)
+                rospy.loginfo("scene2 %s 抓取FK=(%.3f,%.3f,%.3f) det=(%.3f,%.3f,%.3f)", name, _e[0], _e[1], _e[2], x, y, z)
+            except Exception:
+                pass
+            # 空抓重试：夹爪值 >=0.72 说明没夹到（细长螺丝刀 0.73=空，A/B 空也在 0.73 附近）。
+            # 远点件抓取点偶有检测噪声/超调，向后(靠近机器人)+向内(靠近中线)偏移重试，最多 2 次。
+            if g is not None and g >= 0.72:
+                for _ri in range(2):
+                    _rx = gx - 0.03 * (_ri + 1)
+                    _ry = gy + (-0.02 * (_ri + 1) if arm == "left" else 0.02 * (_ri + 1))
+                    _rz = gz - 0.008 * (_ri + 1)   # 每次再下探 8mm（补深度 z 噪声）
+                    runner.set_gripper(GRIP_OPEN, GRIP_OPEN)
+                    rospy.sleep(0.3)
+                    if arm == "right":
+                        runner.right_arm_to(arm_hold, [_rx, _ry, RIGHT_PICK_TRANSIT_IK_Z], quat_grasp)
+                        runner.right_grasp_to(arm_hold, [_rx, _ry, _rz], quat_grasp)
+                        runner.set_gripper(GRIP_OPEN, GRIP_CLOSE)
+                    else:
+                        runner.left_arm_to(arm_hold, [_rx, _ry, RIGHT_PICK_TRANSIT_IK_Z], quat_grasp)
+                        runner.left_grasp_to(arm_hold, [_rx, _ry, _rz], quat_grasp)
+                        runner.set_gripper(GRIP_CLOSE, GRIP_OPEN)
+                    rospy.sleep(1.0)
+                    _g2 = runner.read_gripper_state(arm)
+                    rospy.loginfo("scene2 %s 空抓重试%d GRASP=%s", name, _ri + 1, str(round(_g2, 4)) if _g2 is not None else "None")
+                    if _g2 is not None and _g2 < 0.72:
+                        gx, gy, g, gz = _rx, _ry, _g2, _rz
+                        break
+                if g is not None and g >= 0.72:
+                    rospy.logwarn("scene2 %s 空抓重试后仍空 GRASP=%s，继续流程", name, str(round(g, 4)))
             # 抬升
             lift = [gx, gy, gz + LIFT_Z_OFFSET]
             if arm == "right":
